@@ -1,0 +1,26 @@
+{
+  "name": "web_Safe social venues in Vietnam for meeting people - bars, clubs, ",
+  "topic": "web_search:Safe social venues in Vietnam for meeting people - bars, clubs, karaoke",
+  "keywords": [
+    "safe",
+    "social",
+    "venues",
+    "vietnam",
+    "meeting",
+    "people",
+    "bars",
+    "clubs",
+    "karaoke",
+    "nightlife"
+  ],
+  "dependencies": [],
+  "source": [
+    "https://www.nightlifevietnam.com/",
+    "https://fliptripholidays.in/blog/vietnam-nightlife/",
+    "https://sungetawaystravel.com/vietnam-nightlife-safety/",
+    "https://www.tripadvisor.com/Attractions-g293921-Activities-c20-t99-Vietnam.html",
+    "https://www.tripadvisor.in/Attractions-g293921-Activities-c20-t99-Vietnam.html"
+  ],
+  "version": "1.0.0",
+  "created_at": "2026-02-26T10:51:59+00:00"
+}

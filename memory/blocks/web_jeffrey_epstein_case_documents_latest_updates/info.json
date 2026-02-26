@@ -1,0 +1,26 @@
+{
+  "name": "web_Jeffrey Epstein case documents latest updates",
+  "topic": "web_search:Jeffrey Epstein case documents latest updates",
+  "keywords": [
+    "jeffrey",
+    "epstein",
+    "case",
+    "documents",
+    "latest",
+    "updates",
+    "library",
+    "united",
+    "states",
+    "department"
+  ],
+  "dependencies": [],
+  "source": [
+    "https://www.justice.gov/epstein",
+    "https://www.pbs.org/newshour/politics/see-photos-and-documents-from-the-latest-epstein-file-release",
+    "https://jmail.world/drive",
+    "https://www.nytimes.com/interactive/2026/us/epstein-files-names-fired-resigned-fallout.html",
+    "https://www.cbsnews.com/live-updates/epstein-files-released-documents-2025/"
+  ],
+  "version": "1.0.0",
+  "created_at": "2026-02-26T11:11:47+00:00"
+}

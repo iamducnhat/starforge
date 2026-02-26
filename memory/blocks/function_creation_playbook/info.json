@@ -1,0 +1,21 @@
+{
+  "name": "Function Creation Playbook",
+  "topic": "function_design_and_presearch",
+  "keywords": [
+    "function",
+    "create function",
+    "custom function",
+    "presearch",
+    "search before code",
+    "python download file",
+    "reusable logic",
+    "code generation"
+  ],
+  "dependencies": [],
+  "source": [
+    "runtime_policy",
+    "assistant_prompt"
+  ],
+  "version": "1.0.0",
+  "created_at": "2026-02-26T00:00:00+00:00"
+}
