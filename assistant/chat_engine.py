@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
@@ -11,7 +13,7 @@ from .cli_format import StreamRenderer, extract_answer_text, print_answer_only, 
 from .model import BaseModel
 from .tool_calls import parse_tool_calls
 from .tools import ToolSystem
-from .utils import parse_json_payload
+from .utils import get_env_bool, get_env_int, parse_json_payload
 
 
 class ChatEngine:
@@ -31,11 +33,18 @@ class ChatEngine:
         self.max_history = max_history
         self.max_tool_rounds = max_tool_rounds
         self.autonomous_enabled = autonomous_enabled
-        self.autonomous_steps = max(1, min(autonomous_steps, 30))
+        self.autonomous_steps = 0 if autonomous_steps <= 0 else max(1, min(autonomous_steps, 1000))
+        self.autonomous_default_objective = (
+            "Continuously self-improve this project inside workspace root only: "
+            "plan tasks, research, refactor safely, and keep iterating."
+        )
         self.history: list[dict[str, str]] = []
         self.supervision_log = Path("memory/tool_supervision.jsonl")
         self.tool_finetune_log = Path("memory/tool_finetune_samples.jsonl")
         self._intent_cache: dict[str, dict[str, Any]] = {}
+        self.compact_context_enabled = get_env_bool("ASSISTANT_COMPACT_CONTEXT", True)
+        self.max_context_chars = get_env_int("ASSISTANT_MAX_CONTEXT_CHARS", 180000)
+        self.compacted_context_note = ""
 
     def _generate_with_stream_fallback(self, messages: list[dict[str, str]]) -> str:
         text = self.model.generate(messages)
@@ -176,11 +185,20 @@ class ChatEngine:
             pass
 
     @staticmethod
-    def _continuation_poke(user_message: str, prefer_copyable_function: bool = False) -> dict[str, str]:
+    def _continuation_poke(
+        user_message: str,
+        prefer_copyable_function: bool = False,
+        require_file_tools: bool = False,
+    ) -> dict[str, str]:
         copyable_hint = (
             "\nFor this request, output a copyable function for the user in final text. "
             "Use create_function only when the user explicitly asks to save/store it."
             if prefer_copyable_function
+            else ""
+        )
+        file_hint = (
+            "\nThis is a workspace-edit task. Apply changes via create_file/edit_file tools, not code-only explanation."
+            if require_file_tools
             else ""
         )
         return {
@@ -191,7 +209,7 @@ class ChatEngine:
                 "Tool execution is complete. Continue generation using the latest tool result for the original user request.\n"
                 "If another tool is needed, return JSON tool call only.\n"
                 "Otherwise return final user-facing answer text only.\n"
-                f"{copyable_hint}\n"
+                f"{copyable_hint}{file_hint}\n"
                 "Do not discuss this control message."
             ),
         }
@@ -371,6 +389,9 @@ class ChatEngine:
             for m in (
                 "read file",
                 "read files",
+                "search project",
+                "find in project",
+                "grep",
                 "open file",
                 "edit file",
                 "update file",
@@ -474,13 +495,53 @@ class ChatEngine:
         flags = self._intent_flags(user_message)
         return bool(flags.get("factual", False))
 
+    @staticmethod
+    def _is_time_sensitive_factual(user_message: str) -> bool:
+        t = user_message.lower()
+        markers = (
+            "latest",
+            "newest",
+            "current",
+            "today",
+            "this year",
+            "now",
+            "recent",
+            "2024",
+            "2025",
+            "2026",
+            "trend",
+            "release",
+            "price",
+            "news",
+        )
+        return any(m in t for m in markers)
+
+    def _ensure_datetime_call_for_factual(
+        self,
+        user_message: str,
+        tool_calls: list[dict[str, Any]],
+        datetime_executed: bool,
+    ) -> list[dict[str, Any]]:
+        if not self._requires_web_presearch_for_factual(user_message):
+            return tool_calls
+        if datetime_executed:
+            return tool_calls
+        if any(call.get("name") == "get_current_datetime" for call in tool_calls):
+            return tool_calls
+        if not self._is_time_sensitive_factual(user_message):
+            return tool_calls
+        return [{"name": "get_current_datetime", "args": {}}] + tool_calls
+
     def _presearch_tool_calls_for_factual(self, user_message: str) -> list[dict[str, Any]]:
         keywords = self._extract_keywords(user_message)
         query = self._optimize_search_query(user_message)
-        return [
+        calls = [
             {"name": "find_in_memory", "args": {"keywords": keywords}},
             {"name": "search_web", "args": {"query": query, "level": "auto"}},
         ]
+        if self._is_time_sensitive_factual(user_message):
+            calls.insert(0, {"name": "get_current_datetime", "args": {}})
+        return calls
 
     def _optimize_search_query(self, user_message: str) -> str:
         inferred = self._intent_flags(user_message).get("optimized_query", "")
@@ -551,6 +612,14 @@ class ChatEngine:
 
     def _preinspect_tool_calls_for_workspace(self, user_message: str) -> list[dict[str, Any]]:
         calls: list[dict[str, Any]] = [{"name": "list_files", "args": {"path": ".", "max_entries": 200}}]
+        keyword_query = " ".join(self._extract_keywords(user_message, limit=5))
+        if keyword_query:
+            calls.append(
+                {
+                    "name": "search_project",
+                    "args": {"query": keyword_query, "path": ".", "max_matches": 60},
+                }
+            )
         for p in self._extract_explicit_file_paths(user_message):
             calls.append({"name": "read_file", "args": {"path": p, "max_chars": 6000}})
         return calls
@@ -621,6 +690,20 @@ class ChatEngine:
                         lines.append(f"   {excerpt}")
                 return "\n".join(lines)
 
+            if tool_name == "search_project" and isinstance(result, dict):
+                matches = result.get("matches", [])
+                if not isinstance(matches, list) or not matches:
+                    continue
+                lines = ["I searched the project and found matches:"]
+                for i, m in enumerate(matches[:8], start=1):
+                    path = str(m.get("path", "")).strip()
+                    line = m.get("line", "")
+                    text = str(m.get("text", "")).strip()
+                    if len(text) > 160:
+                        text = text[:157] + "..."
+                    lines.append(f"{i}. {path}:{line} {text}")
+                return "\n".join(lines)
+
             if tool_name == "find_in_memory" and isinstance(result, dict):
                 matches = result.get("matches", [])
                 if not matches:
@@ -633,6 +716,15 @@ class ChatEngine:
                     knowledge = knowledge[:447] + "..."
                 return f"I found relevant memory block `{name}` ({topic}).\n{knowledge}"
 
+            if tool_name == "get_current_datetime" and isinstance(result, dict):
+                dt = result.get("datetime", {})
+                if isinstance(dt, dict):
+                    date = str(dt.get("date", "")).strip()
+                    time = str(dt.get("time", "")).strip()
+                    tz = str(dt.get("timezone", "")).strip()
+                    if date:
+                        return f"Current runtime date/time: {date} {time} {tz}".strip()
+
             if tool_name == "create_function" and isinstance(result, dict):
                 if result.get("policy") == "copyable_function":
                     code = str(result.get("code", "")).strip()
@@ -641,19 +733,59 @@ class ChatEngine:
         return None
 
     def _messages(self) -> list[dict[str, str]]:
-        return [{"role": "system", "content": self.system_prompt}] + self.history[-self.max_history :]
+        self._compact_context_if_needed()
+        msgs = [{"role": "system", "content": self.system_prompt}]
+        if self.compacted_context_note:
+            msgs.append({"role": "system", "content": self.compacted_context_note})
+        msgs.extend(self.history[-self.max_history :])
+        return msgs
+
+    def _compact_context_if_needed(self) -> None:
+        if not self.compact_context_enabled:
+            return
+        if not self.history:
+            return
+        total_chars = sum(len(m.get("content", "")) for m in self.history)
+        if len(self.history) <= (self.max_history * 2) and total_chars <= self.max_context_chars:
+            return
+
+        keep_tail = max(self.max_history, 12)
+        if len(self.history) <= keep_tail + 4:
+            return
+
+        head = self.history[: -keep_tail]
+        tail = self.history[-keep_tail:]
+
+        summary_lines = ["Compacted conversation context (older turns):"]
+        for msg in head[-120:]:
+            role = msg.get("role", "unknown")
+            content = self._strip_thinking(msg.get("content", ""))
+            content = re.sub(r"\s+", " ", content).strip()
+            if len(content) > 220:
+                content = content[:217] + "..."
+            if not content:
+                continue
+            summary_lines.append(f"- {role}: {content}")
+        summary = "\n".join(summary_lines)
+        if len(summary) > 18000:
+            summary = summary[:17997] + "..."
+
+        self.compacted_context_note = summary
+        self.history = tail
 
     def handle_turn(
         self,
         user_message: str,
         on_tool: Callable[[str, dict[str, object], dict[str, object]], None] | None = None,
         on_tool_start: Callable[[str, dict[str, object]], None] | None = None,
+        enforce_presearch: bool = True,
     ) -> str:
         self.history.append({"role": "user", "content": user_message})
         continue_after_tools = False
         emergency_tools_used = False
         tools_executed_this_turn = False
         web_search_executed_this_turn = False
+        datetime_executed_this_turn = False
 
         for _ in range(self.max_tool_rounds):
             messages = self._messages()
@@ -662,6 +794,7 @@ class ChatEngine:
                     self._continuation_poke(
                         user_message,
                         prefer_copyable_function=self._prefer_copyable_function_reply(user_message),
+                        require_file_tools=self._requires_workspace_preinspect(user_message),
                     )
                 ]
             assistant_text = self.model.generate(messages)
@@ -669,11 +802,17 @@ class ChatEngine:
             if not tool_calls and self._contains_tool_denial(self._strip_thinking(assistant_text)):
                 self._log_supervision("tool_denial_detected", user_message, assistant_text)
                 tool_calls = self._recover_tool_calls(user_message=user_message, raw_assistant_text=assistant_text)
-            tool_calls = self._ensure_web_call_for_factual(
-                user_message=user_message,
-                tool_calls=tool_calls,
-                web_search_executed=web_search_executed_this_turn,
-            )
+            if enforce_presearch:
+                tool_calls = self._ensure_datetime_call_for_factual(
+                    user_message=user_message,
+                    tool_calls=tool_calls,
+                    datetime_executed=datetime_executed_this_turn,
+                )
+                tool_calls = self._ensure_web_call_for_factual(
+                    user_message=user_message,
+                    tool_calls=tool_calls,
+                    web_search_executed=web_search_executed_this_turn,
+                )
 
             if not tool_calls:
                 clean = self._strip_thinking(assistant_text)
@@ -722,13 +861,13 @@ class ChatEngine:
                             clean = assistant_text
                     presearch: list[dict[str, Any]] = []
                     event_name = ""
-                    if clean and self._requires_workspace_preinspect(user_message) and not tools_executed_this_turn:
+                    if enforce_presearch and clean and self._requires_workspace_preinspect(user_message) and not tools_executed_this_turn:
                         presearch = self._preinspect_tool_calls_for_workspace(user_message)
                         event_name = "workspace_preinspect"
-                    elif clean and self._requires_presearch_for_code(user_message) and not tools_executed_this_turn:
+                    elif enforce_presearch and clean and self._requires_presearch_for_code(user_message) and not tools_executed_this_turn:
                         presearch = self._presearch_tool_calls_for_code(user_message)
                         event_name = "presearch_for_code"
-                    elif clean and self._requires_web_presearch_for_factual(user_message) and not web_search_executed_this_turn:
+                    elif enforce_presearch and clean and self._requires_web_presearch_for_factual(user_message) and not web_search_executed_this_turn:
                         presearch = self._presearch_tool_calls_for_factual(user_message)
                         event_name = "presearch_for_factual"
                     if presearch:
@@ -761,6 +900,8 @@ class ChatEngine:
                     on_tool(call["name"], call.get("args", {}), result)
                 if call["name"] == "search_web" and isinstance(result, dict) and result.get("ok", False):
                     web_search_executed_this_turn = True
+                if call["name"] == "get_current_datetime" and isinstance(result, dict) and result.get("ok", False):
+                    datetime_executed_this_turn = True
                 tool_payload = {
                     "tool": call["name"],
                     "args": call.get("args", {}),
@@ -786,12 +927,14 @@ class ChatEngine:
         on_tool: Callable[[str, dict[str, object], dict[str, object]], None] | None = None,
         on_tool_start: Callable[[str, dict[str, object]], None] | None = None,
         on_tool_phase: Callable[[], None] | None = None,
+        enforce_presearch: bool = True,
     ) -> str:
         self.history.append({"role": "user", "content": user_message})
         continue_after_tools = False
         emergency_tools_used = False
         tools_executed_this_turn = False
         web_search_executed_this_turn = False
+        datetime_executed_this_turn = False
 
         for _ in range(self.max_tool_rounds):
             assistant_text = ""
@@ -804,6 +947,7 @@ class ChatEngine:
                     self._continuation_poke(
                         user_message,
                         prefer_copyable_function=self._prefer_copyable_function_reply(user_message),
+                        require_file_tools=self._requires_workspace_preinspect(user_message),
                     )
                 ]
 
@@ -831,11 +975,17 @@ class ChatEngine:
             if not tool_calls and self._contains_tool_denial(self._strip_thinking(assistant_text)):
                 self._log_supervision("tool_denial_detected", user_message, assistant_text)
                 tool_calls = self._recover_tool_calls(user_message=user_message, raw_assistant_text=assistant_text)
-            tool_calls = self._ensure_web_call_for_factual(
-                user_message=user_message,
-                tool_calls=tool_calls,
-                web_search_executed=web_search_executed_this_turn,
-            )
+            if enforce_presearch:
+                tool_calls = self._ensure_datetime_call_for_factual(
+                    user_message=user_message,
+                    tool_calls=tool_calls,
+                    datetime_executed=datetime_executed_this_turn,
+                )
+                tool_calls = self._ensure_web_call_for_factual(
+                    user_message=user_message,
+                    tool_calls=tool_calls,
+                    web_search_executed=web_search_executed_this_turn,
+                )
             if not tool_calls:
                 pending_nonthink = "".join(pending_nonthink_chunks)
                 clean = self._strip_thinking(assistant_text)
@@ -884,13 +1034,13 @@ class ChatEngine:
                             clean = assistant_text
                     presearch: list[dict[str, Any]] = []
                     event_name = ""
-                    if clean and self._requires_workspace_preinspect(user_message) and not tools_executed_this_turn:
+                    if enforce_presearch and clean and self._requires_workspace_preinspect(user_message) and not tools_executed_this_turn:
                         presearch = self._preinspect_tool_calls_for_workspace(user_message)
                         event_name = "workspace_preinspect"
-                    elif clean and self._requires_presearch_for_code(user_message) and not tools_executed_this_turn:
+                    elif enforce_presearch and clean and self._requires_presearch_for_code(user_message) and not tools_executed_this_turn:
                         presearch = self._presearch_tool_calls_for_code(user_message)
                         event_name = "presearch_for_code"
-                    elif clean and self._requires_web_presearch_for_factual(user_message) and not web_search_executed_this_turn:
+                    elif enforce_presearch and clean and self._requires_web_presearch_for_factual(user_message) and not web_search_executed_this_turn:
                         presearch = self._presearch_tool_calls_for_factual(user_message)
                         event_name = "presearch_for_factual"
                     if presearch:
@@ -927,6 +1077,8 @@ class ChatEngine:
                     on_tool(call["name"], call.get("args", {}), result)
                 if call["name"] == "search_web" and isinstance(result, dict) and result.get("ok", False):
                     web_search_executed_this_turn = True
+                if call["name"] == "get_current_datetime" and isinstance(result, dict) and result.get("ok", False):
+                    datetime_executed_this_turn = True
                 tool_payload = {
                     "tool": call["name"],
                     "args": call.get("args", {}),
@@ -948,8 +1100,16 @@ class ChatEngine:
     def run_cli(self) -> None:
         print("Local Coding Assistant")
         print("Type 'exit' or 'quit' to stop.")
-        print("Commands: /reset, /maxout <n>, /maxout, /stream <auto|native|chunk>, /stream")
-        print("Autonomous: /auto, /auto on [steps], /auto off")
+        print(
+            "Commands: /reset, /status, /maxout <n>, /maxout, /ctx <n>, /ctx, "
+            "/autosize [apply|status], /stream <auto|native|chunk>, /stream, /compact [on|off|status]"
+        )
+        print("Autonomous: /auto, /auto on [steps|infinite], /auto off")
+
+        if self.autonomous_enabled:
+            steps_text = "infinite" if self.autonomous_steps <= 0 else str(self.autonomous_steps)
+            print(f"autonomous boot: on (steps={steps_text})")
+            self.run_autonomous(self.autonomous_default_objective, self.autonomous_steps)
 
         while True:
             try:
@@ -959,6 +1119,8 @@ class ChatEngine:
                 return
 
             if not user_input:
+                if self.autonomous_enabled:
+                    self.run_autonomous(self.autonomous_default_objective, self.autonomous_steps)
                 continue
             if user_input.lower() in {"exit", "quit"}:
                 print("bye")
@@ -970,6 +1132,9 @@ class ChatEngine:
             if user_input.startswith("/"):
                 parts = user_input.strip().split()
                 cmd = parts[0].lower()
+                if cmd in {"/quit", "/exit"}:
+                    print("bye")
+                    return
                 if cmd in {"/maxout", "/maxoutput", "/max_output"}:
                     if len(parts) == 1:
                         getter = getattr(self.model, "get_max_output_tokens", None)
@@ -991,6 +1156,27 @@ class ChatEngine:
                     ok, msg = setter(value)
                     print(msg)
                     continue
+                if cmd in {"/ctx", "/context"}:
+                    if len(parts) == 1:
+                        getter = getattr(self.model, "get_context_window", None)
+                        current = getter() if callable(getter) else None
+                        if current is None:
+                            print("context window: unavailable for this model")
+                        else:
+                            print(f"context window: {current}")
+                        continue
+                    try:
+                        value = int(parts[1])
+                    except ValueError:
+                        print("usage: /ctx <positive_integer>")
+                        continue
+                    setter = getattr(self.model, "set_context_window", None)
+                    if not callable(setter):
+                        print("this model does not support changing context window")
+                        continue
+                    ok, msg = setter(value)
+                    print(msg)
+                    continue
                 if cmd == "/stream":
                     if len(parts) == 1:
                         getter = getattr(self.model, "get_stream_mode", None)
@@ -1004,20 +1190,80 @@ class ChatEngine:
                     ok, msg = setter(parts[1])
                     print(msg)
                     continue
+                if cmd == "/compact":
+                    if len(parts) == 1 or parts[1].lower() == "status":
+                        mode = "on" if self.compact_context_enabled else "off"
+                        print(f"compact context: {mode} (threshold_chars={self.max_context_chars})")
+                        continue
+                    sub = parts[1].lower()
+                    if sub in {"on", "off"}:
+                        self.compact_context_enabled = sub == "on"
+                        print(f"compact context: {sub}")
+                        continue
+                    print("usage: /compact [on|off|status]")
+                    continue
+                if cmd in {"/autosize", "/autolimits", "/autolimit"}:
+                    getter = getattr(self.model, "get_auto_limits", None)
+                    applier = getattr(self.model, "apply_auto_limits", None)
+                    if len(parts) == 1 or parts[1].lower() == "apply":
+                        if not callable(applier):
+                            print("this model does not support auto limit tuning")
+                            continue
+                        ok, msg = applier()
+                        print(msg)
+                        continue
+                    if parts[1].lower() in {"status", "show"}:
+                        data = getter() if callable(getter) else None
+                        if isinstance(data, dict) and data:
+                            print("auto limits:")
+                            for k, v in data.items():
+                                print(f"- {k}: {v}")
+                        else:
+                            print("auto limits: unavailable for this model")
+                        continue
+                    print("usage: /autosize [apply|status]")
+                    continue
+                if cmd == "/status":
+                    getter_stream = getattr(self.model, "get_stream_mode", None)
+                    getter_maxout = getattr(self.model, "get_max_output_tokens", None)
+                    getter_ctx = getattr(self.model, "get_context_window", None)
+                    getter_auto = getattr(self.model, "get_auto_limits", None)
+                    stream_mode = getter_stream() if callable(getter_stream) else "unknown"
+                    maxout = getter_maxout() if callable(getter_maxout) else None
+                    ctx = getter_ctx() if callable(getter_ctx) else None
+                    auto_limits = getter_auto() if callable(getter_auto) else None
+                    print("status:")
+                    print(f"- stream: {stream_mode}")
+                    print(f"- maxout: {maxout if maxout is not None else 'n/a'}")
+                    print(f"- ctx: {ctx if ctx is not None else 'n/a'}")
+                    if isinstance(auto_limits, dict) and auto_limits:
+                        parts_auto = ", ".join(f"{k}={v}" for k, v in auto_limits.items())
+                        print(f"- autosize: {parts_auto}")
+                    print(f"- compact: {'on' if self.compact_context_enabled else 'off'} ({self.max_context_chars} chars)")
+                    print(f"- autonomous: {'on' if self.autonomous_enabled else 'off'}")
+                    continue
                 if cmd in {"/help", "help"}:
                     print("Commands:")
                     print("- /reset")
+                    print("- /exit, /quit")
+                    print("- /status       show runtime settings")
                     print("- /maxout <n>   set max output tokens")
                     print("- /maxout       show current max output tokens")
+                    print("- /ctx <n>      set context window (if supported)")
+                    print("- /ctx          show current context window")
+                    print("- /autosize     apply auto context/maxout tuning")
+                    print("- /autosize status")
                     print("- /stream <auto|native|chunk>   set stream mode")
                     print("- /stream       show current stream mode")
+                    print("- /compact [on|off|status]")
                     print("- /auto         show autonomous status")
-                    print("- /auto on [steps] / /auto off")
+                    print("- /auto on [steps|infinite] / /auto off")
                     continue
                 if cmd in {"/auto", "/autonomous"}:
                     if len(parts) == 1:
                         mode = "on" if self.autonomous_enabled else "off"
-                        print(f"autonomous: {mode} (steps={self.autonomous_steps})")
+                        steps_text = "infinite" if self.autonomous_steps <= 0 else str(self.autonomous_steps)
+                        print(f"autonomous: {mode} (steps={steps_text})")
                         continue
                     sub = parts[1].lower()
                     if sub == "off":
@@ -1026,15 +1272,23 @@ class ChatEngine:
                         continue
                     if sub == "on":
                         if len(parts) >= 3:
-                            try:
-                                self.autonomous_steps = max(1, min(int(parts[2]), 30))
-                            except ValueError:
-                                print("usage: /auto on [steps]")
-                                continue
+                            raw_steps = parts[2].strip().lower()
+                            if raw_steps in {"0", "inf", "infinite", "forever"}:
+                                self.autonomous_steps = 0
+                            else:
+                                try:
+                                    self.autonomous_steps = max(1, min(int(raw_steps), 1000))
+                                except ValueError:
+                                    print("usage: /auto on [steps|infinite]")
+                                    continue
+                        else:
+                            self.autonomous_steps = 0
                         self.autonomous_enabled = True
-                        print(f"autonomous: on (steps={self.autonomous_steps})")
+                        steps_text = "infinite" if self.autonomous_steps <= 0 else str(self.autonomous_steps)
+                        print(f"autonomous: on (steps={steps_text})")
+                        print("tip: press Enter to start default autonomous objective, or type a custom objective.")
                         continue
-                    print("usage: /auto | /auto on [steps] | /auto off")
+                    print("usage: /auto | /auto on [steps|infinite] | /auto off")
                     continue
 
             if self.autonomous_enabled:
@@ -1058,38 +1312,115 @@ class ChatEngine:
                     print_answer_only(answer)
 
     def run_autonomous(self, objective: str, steps: int) -> None:
-        max_steps = max(1, min(steps, 30))
-        print(f"autonomous run: objective='{objective}' | steps={max_steps}")
+        finite_steps = steps > 0
+        max_steps = max(1, min(steps, 1000)) if finite_steps else 0
+        steps_text = str(max_steps) if finite_steps else "infinite"
+        print(f"autonomous run: objective='{objective}' | steps={steps_text}")
         print("scope: workspace root only")
+        repeated_signature_count = 0
+        last_signature = ""
+        stale_count = 0
+        last_text = ""
+        rate_limit_count = 0
+        i = 0
+        try:
+            while True:
+                i += 1
+                if finite_steps and i > max_steps:
+                    print("[auto] step limit reached")
+                    return
 
-        for i in range(1, max_steps + 1):
-            if i == 1:
-                prompt = (
-                    "Autonomous mode enabled.\n"
-                    f"Objective: {objective}\n"
-                    "You may plan, research, read/edit files, and improve the project inside workspace root only.\n"
-                    "If finished, include token AUTONOMOUS_DONE in final answer."
-                )
-            else:
-                prompt = (
-                    "Autonomous continue.\n"
-                    f"Objective: {objective}\n"
-                    f"Step: {i}/{max_steps}\n"
-                    "Choose next best action yourself. If finished, include token AUTONOMOUS_DONE."
-                )
+                if i == 1:
+                    prompt = (
+                        "Autonomous mode enabled.\n"
+                        f"Objective: {objective}\n"
+                        "You may plan, research, read/edit files, and improve the project inside workspace root only.\n"
+                        "If finished, output a final line that starts with: AUTONOMOUS_DONE\n"
+                        "If continuing is no longer useful, output a final line that starts with: AUTONOMOUS_BORED"
+                    )
+                else:
+                    step_label = f"{i}/{max_steps}" if finite_steps else f"{i}/infinite"
+                    prompt = (
+                        "Autonomous continue.\n"
+                        f"Objective: {objective}\n"
+                        f"Step: {step_label}\n"
+                        "Choose next best action yourself.\n"
+                        "If finished, output a final line that starts with: AUTONOMOUS_DONE\n"
+                        "If continuing is no longer useful, output a final line that starts with: AUTONOMOUS_BORED"
+                    )
 
-            print(f"\n[auto step {i}/{max_steps}]")
-            renderer = StreamRenderer()
-            response = self.handle_turn_stream(
-                prompt,
-                renderer.feed,
-                print_tool_event,
-                print_tool_start,
-                renderer.prepare_tool_output,
-            )
-            renderer.finish()
-            final_text = extract_answer_text(response).strip()
-            if re.search(r"\bAUTONOMOUS_DONE\b", final_text, flags=re.IGNORECASE):
-                print("[auto] done")
-                return
-        print("[auto] step limit reached")
+                print(f"\n[auto step {i}/{steps_text}]")
+                renderer = StreamRenderer()
+                response = self.handle_turn_stream(
+                    prompt,
+                    renderer.feed,
+                    print_tool_event,
+                    print_tool_start,
+                    renderer.prepare_tool_output,
+                    enforce_presearch=False,
+                )
+                renderer.finish()
+                final_text = extract_answer_text(response).strip()
+                tool_signature = self._autonomous_tool_signature()
+                if tool_signature and tool_signature == last_signature:
+                    repeated_signature_count += 1
+                else:
+                    repeated_signature_count = 0
+                    last_signature = tool_signature
+
+                if final_text == last_text and final_text:
+                    stale_count += 1
+                else:
+                    stale_count = 0
+                    last_text = final_text
+
+                lower_text = final_text.lower()
+                if "429" in final_text or "too many requests" in lower_text:
+                    wait = min(120, 15 * (2 ** rate_limit_count))
+                    print(f"[auto] rate limited, waiting {wait}s before retrying step {i}...")
+                    time.sleep(wait)
+                    rate_limit_count += 1
+                    i -= 1  # retry the same step
+                    continue
+                rate_limit_count = 0
+                if "model backend not available" in lower_text or "openrouter unavailable" in lower_text:
+                    print("[auto] stopped: model backend unavailable")
+                    return
+                if "payment required" in lower_text or "402" in final_text:
+                    print("[auto] stopped: model requires payment (402). Add credits or set OPENROUTER_FALLBACK_MODEL to a free model.")
+                    return
+                if re.search(r"(?mi)^\s*AUTONOMOUS_DONE\b", final_text):
+                    print("[auto] done")
+                    return
+                if re.search(r"(?mi)^\s*AUTONOMOUS_BORED\b", final_text):
+                    print("[auto] stopped by model (bored/no useful next action)")
+                    return
+                if repeated_signature_count >= 5:
+                    print("[auto] stopped: repeated tool loop detected")
+                    return
+                if stale_count >= 5:
+                    print("[auto] stopped: repeated unchanged output")
+                    return
+        except KeyboardInterrupt:
+            print("\n[auto] interrupted (^C)")
+            return
+
+    def _autonomous_tool_signature(self) -> str:
+        parts: list[str] = []
+        for msg in reversed(self.history):
+            if msg.get("role") != "tool":
+                if parts:
+                    break
+                continue
+            try:
+                payload = json.loads(msg.get("content", ""))
+            except Exception:
+                continue
+            name = str(payload.get("tool", "")).strip()
+            args = payload.get("args", {})
+            if not name:
+                continue
+            parts.append(f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}")
+            if len(parts) >= 3:
+                break
+        return "|".join(sorted(parts))

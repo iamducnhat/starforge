@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,15 +28,32 @@ def read_json(path: Path) -> Any:
         return json.load(f)
 
 
-def write_json(path: Path, data: Any) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-
-
 def write_text(path: Path, text: str) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        f.write(text)
+    """Write text to a file atomically using a temporary file."""
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    # Create a temporary file in the same directory to ensure atomic rename
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        # os.replace is atomic on both POSIX and Windows (Python 3.3+)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        raise
+
+
+def write_json(path: Path, data: Any) -> None:
+    """Write data to a JSON file atomically."""
+    content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    write_text(path, content)
 
 
 def _extract_json_code_block(text: str) -> list[str]:
@@ -117,6 +136,34 @@ def normalize_keywords(keywords: list[str]) -> list[str]:
 
 def short_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False)
+
+
+def get_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def get_env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def get_env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "off", "no"}
 
 
 _SECRET_KEY_RE = re.compile(

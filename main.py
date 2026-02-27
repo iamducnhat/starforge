@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 from assistant.cli_format import print_formatted_output, print_tool_event
+from assistant.logging_config import setup_logging
 from assistant.chat_engine import ChatEngine
 from assistant.functions_registry import FunctionRegistry
 from assistant.memory import MemoryStore
@@ -14,7 +15,9 @@ from assistant.tools import ToolSystem
 from assistant.workspace_tools import WorkspaceTools
 
 
-def load_dotenv(path: str | Path = ".env") -> None:
+def load_dotenv(path: str | Path | None = None) -> None:
+    if path is None:
+        path = Path(__file__).resolve().parent / ".env"
     env_path = Path(path)
     if not env_path.exists() or not env_path.is_file():
         return
@@ -43,6 +46,7 @@ def build_engine(
     ollama_url: str,
     openrouter_url: str,
     openrouter_api_key: str | None,
+    google_api_key: str | None = None,
     autonomous_enabled: bool = False,
     autonomous_steps: int = 6,
 ) -> ChatEngine:
@@ -62,6 +66,7 @@ def build_engine(
         ollama_url=ollama_url,
         openrouter_url=openrouter_url,
         openrouter_api_key=openrouter_api_key,
+        google_api_key=google_api_key,
     )
 
     return ChatEngine(
@@ -114,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--provider",
         default=os.getenv("ASSISTANT_PROVIDER", "openrouter"),
-        choices=["auto", "ollama", "openrouter"],
+        choices=["auto", "ollama", "openrouter", "google"],
         help="Model backend provider",
     )
     parser.add_argument(
@@ -131,6 +136,11 @@ def parse_args() -> argparse.Namespace:
         "--openrouter-api-key",
         default=os.getenv("OPENROUTER_API_KEY", ""),
         help="OpenRouter API key",
+    )
+    parser.add_argument(
+        "--google-api-key",
+        default=os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", "")),
+        help="Google AI Studio API key (or use GEMINI_API_KEY env var)",
     )
     parser.add_argument(
         "--list-models",
@@ -150,8 +160,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--autonomous-steps",
         type=int,
-        default=int(os.getenv("ASSISTANT_AUTONOMOUS_STEPS", "6")),
-        help="Max autonomous steps per objective (1-30)",
+        default=int(os.getenv("ASSISTANT_AUTONOMOUS_STEPS", "0")),
+        help="Max autonomous steps per objective (>0 finite, 0 infinite)",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose logging to stderr",
     )
     return parser.parse_args()
 
@@ -159,6 +175,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     load_dotenv()
     args = parse_args()
+    setup_logging(verbose=args.verbose)
     if args.list_models:
         models = list_openrouter_models(
             api_key=args.openrouter_api_key,
@@ -178,6 +195,7 @@ def main() -> None:
         ollama_url=args.ollama_url,
         openrouter_url=args.openrouter_url,
         openrouter_api_key=args.openrouter_api_key,
+        google_api_key=args.google_api_key,
         autonomous_enabled=args.autonomous,
         autonomous_steps=args.autonomous_steps,
     )

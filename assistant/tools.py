@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .functions_registry import FunctionRegistry
+from .logging_config import get_logger
 from .memory import MemoryStore
-from .utils import normalize_keywords
+from .utils import get_env_float, get_env_int, normalize_keywords
 from .web import extract_code_snippets, read_web, scrape_web, search_web
 from .workspace_tools import WorkspaceTools
 
+
+logger = get_logger(__name__)
 
 class ToolSystem:
     def __init__(
@@ -30,13 +34,16 @@ class ToolSystem:
             "extract_code_snippets": self.extract_code_snippets,
             "list_files": self.list_files,
             "read_file": self.read_file,
+            "create_file": self.create_file,
             "write_file": self.write_file,
             "edit_file": self.edit_file,
+            "search_project": self.search_project,
             "create_plan": self.create_plan,
             "list_plans": self.list_plans,
             "get_plan": self.get_plan,
             "add_todo": self.add_todo,
             "update_todo": self.update_todo,
+            "get_current_datetime": self.get_current_datetime,
         }
 
     def tool_names(self) -> list[str]:
@@ -44,17 +51,23 @@ class ToolSystem:
 
     def execute(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         if name not in self._tools:
+            logger.error(f"Unknown tool requested: {name}")
             return {"ok": False, "error": f"unknown tool: {name}"}
 
         args = args or {}
+        logger.debug(f"Executing tool: {name} with args: {args}")
         try:
             result = self._tools[name](**args)
             if isinstance(result, dict) and "ok" in result:
+                if not result.get("ok"):
+                    logger.warning(f"Tool {name} returned error: {result.get('error')}")
                 return result
             return {"ok": True, "result": result}
         except TypeError as e:
+            logger.error(f"Invalid arguments for tool {name}: {e}")
             return {"ok": False, "error": f"invalid args for {name}: {e}"}
         except Exception as e:  # pragma: no cover
+            logger.exception(f"Tool execution failed: {name}: {e}")
             return {"ok": False, "error": f"tool execution failed: {e}"}
 
     def find_in_memory(self, keywords: list[str]) -> dict[str, Any]:
@@ -81,15 +94,41 @@ class ToolSystem:
         self,
         name: str,
         description: str,
-        code: str,
         keywords: list[str],
+        code: str = "",
+        tool_name: str = "",
+        tool_args: dict[str, Any] | None = None,
+        tool_calls: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         return self.function_registry.create_function(
             name=name,
             description=description,
-            code=code,
             keywords=keywords,
+            code=code,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            tool_calls=tool_calls,
         )
+
+    @staticmethod
+    def get_current_datetime() -> dict[str, Any]:
+        now_utc = datetime.now(timezone.utc)
+        now_local = now_utc.astimezone()
+        return {
+            "ok": True,
+            "datetime": {
+                "utc_iso": now_utc.isoformat(),
+                "local_iso": now_local.isoformat(),
+                "date": now_local.strftime("%Y-%m-%d"),
+                "time": now_local.strftime("%H:%M:%S"),
+                "timezone": str(now_local.tzinfo or "local"),
+                "year": int(now_local.strftime("%Y")),
+                "month": int(now_local.strftime("%m")),
+                "day": int(now_local.strftime("%d")),
+                "weekday": now_local.strftime("%A"),
+                "unix": int(now_utc.timestamp()),
+            },
+        }
 
     @staticmethod
     def _web_keywords(query: str, results: list[dict[str, Any]], limit: int = 10) -> list[str]:
@@ -288,7 +327,11 @@ class ToolSystem:
             max_chars=max_chars,
         )
 
+    def create_file(self, path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
+        return self.workspace_tools.create_file(path=path, content=content, overwrite=overwrite)
+
     def write_file(self, path: str, content: str, append: bool = False) -> dict[str, Any]:
+        # Backward-compatible alias.
         return self.workspace_tools.write_file(path=path, content=content, append=append)
 
     def edit_file(
@@ -303,6 +346,24 @@ class ToolSystem:
             find_text=find_text,
             replace_text=replace_text,
             replace_all=replace_all,
+        )
+
+    def search_project(
+        self,
+        query: str,
+        path: str = ".",
+        glob: str = "**/*",
+        case_sensitive: bool = False,
+        regex: bool = False,
+        max_matches: int = 200,
+    ) -> dict[str, Any]:
+        return self.workspace_tools.search_project(
+            query=query,
+            path=path,
+            glob=glob,
+            case_sensitive=case_sensitive,
+            regex=regex,
+            max_matches=max_matches,
         )
 
     def create_plan(self, title: str, goal: str, steps: list[str]) -> dict[str, Any]:

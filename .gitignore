@@ -12,12 +12,16 @@ __pycache__/
 # Secrets / local config
 .env
 
-# Runtime/generated logs
+# Runtime/generated memory & logs
 memory/tool_finetune_samples.jsonl
 memory/tool_supervision.jsonl
 memory/plans/*.json
+memory/blocks/
 
 # Optional local virtual envs
 .venv/
 venv/
 env/
+
+# Fine-tune outputs/checkpoints
+finetune/output/

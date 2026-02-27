@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
+import subprocess
+import json
 from pathlib import Path
 from typing import Any
 
 from .utils import ensure_dir, read_json, redact_secrets_text, slugify, utc_now_iso, write_json, write_text
+from .logging_config import get_logger
 
+logger = get_logger(__name__)
 
 class WorkspaceTools:
     def __init__(self, workspace_root: str | Path) -> None:
@@ -14,8 +20,13 @@ class WorkspaceTools:
         ensure_dir(self.plans_dir)
 
     def _resolve(self, path: str) -> Path:
+        """Resolve a path relative to workspace root with security validation."""
         raw = Path(path)
-        resolved = raw.resolve() if raw.is_absolute() else (self.workspace_root / raw).resolve()
+        try:
+            resolved = raw.resolve() if raw.is_absolute() else (self.workspace_root / raw).resolve()
+        except Exception as e:
+            raise ValueError(f"invalid path: {path}") from e
+
         root_str = str(self.workspace_root)
         resolved_str = str(resolved)
         if resolved_str != root_str and not resolved_str.startswith(root_str + os.sep):
@@ -35,7 +46,23 @@ class WorkspaceTools:
         include_hidden: bool = False,
         max_entries: int = 200,
     ) -> dict[str, Any]:
-        base = self._resolve(path)
+        """List files in a directory with comprehensive validation and error handling."""
+        
+        # Validate input parameters
+        if not isinstance(path, str):
+            return {"ok": False, "error": "path must be a string"}
+        if not isinstance(glob, str):
+            return {"ok": False, "error": "glob must be a string"}
+        if not isinstance(include_hidden, bool):
+            return {"ok": False, "error": "include_hidden must be a boolean"}
+        if not isinstance(max_entries, int) or max_entries < 1:
+            return {"ok": False, "error": "max_entries must be a positive integer"}
+
+        try:
+            base = self._resolve(path)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
         if not base.exists():
             return {"ok": False, "error": f"path not found: {path}"}
         if not base.is_dir():
@@ -44,24 +71,28 @@ class WorkspaceTools:
         entries: list[dict[str, Any]] = []
         pattern = glob.strip() or "**/*"
 
-        for p in base.glob(pattern):
-            if len(entries) >= max(1, max_entries):
-                break
+        try:
+            for p in base.glob(pattern):
+                if len(entries) >= max(1, max_entries):
+                    break
 
-            rel = self._to_workspace_rel(p)
-            if not include_hidden and any(part.startswith(".") for part in Path(rel).parts):
-                continue
-            if p.is_dir():
-                continue
+                rel = self._to_workspace_rel(p)
+                if not include_hidden and any(part.startswith(".") for part in Path(rel).parts):
+                    continue
+                if p.is_dir():
+                    continue
 
-            try:
-                size = p.stat().st_size
-            except Exception:
-                size = 0
-            entries.append({"path": rel, "size": size})
+                try:
+                    size = p.stat().st_size
+                except Exception:
+                    size = 0
+                entries.append({"path": rel, "size": size})
 
-        entries.sort(key=lambda x: x["path"])
-        return {"ok": True, "root": self._to_workspace_rel(base), "count": len(entries), "files": entries}
+            entries.sort(key=lambda x: x["path"])
+            return {"ok": True, "root": self._to_workspace_rel(base), "count": len(entries), "files": entries}
+        except Exception as e:
+            logger.error(f"Failed to list files in {path}: {e}")
+            return {"ok": False, "error": f"error listing files: {str(e)}", "hint": "Check permissions and path validity"}
 
     def read_file(
         self,
@@ -72,8 +103,10 @@ class WorkspaceTools:
     ) -> dict[str, Any]:
         file_path = self._resolve(path)
         if not file_path.exists():
+            logger.warning(f"Read failed: file not found: {path}")
             return {"ok": False, "error": f"file not found: {path}"}
         if not file_path.is_file():
+            logger.warning(f"Read failed: not a file: {path}")
             return {"ok": False, "error": f"not a file: {path}"}
 
         text = file_path.read_text(encoding="utf-8", errors="replace")
@@ -98,17 +131,39 @@ class WorkspaceTools:
             "content": masked,
         }
 
-    def write_file(self, path: str, content: str, append: bool = False) -> dict[str, Any]:
+    def create_file(self, path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
         file_path = self._resolve(path)
         ensure_dir(file_path.parent)
 
+        if file_path.exists() and not overwrite:
+            logger.warning(f"Create failed: file already exists: {path}")
+            return {
+                "ok": False,
+                "error": f"file already exists: {path}",
+                "hint": "Use edit_file to update existing files, or create_file(..., overwrite=true) to replace.",
+            }
+        write_text(file_path, content)
+
+        return {"ok": True, "path": self._to_workspace_rel(file_path), "bytes": len(content.encode("utf-8"))}
+
+    def write_file(self, path: str, content: str, append: bool = False) -> dict[str, Any]:
+        # Backward-compatible shim. Prefer create_file + edit_file in tool protocol.
+        file_path = self._resolve(path)
+        ensure_dir(file_path.parent)
         if append:
             with file_path.open("a", encoding="utf-8") as f:
                 f.write(content)
-        else:
-            write_text(file_path, content)
-
-        return {"ok": True, "path": self._to_workspace_rel(file_path), "bytes": len(content.encode("utf-8"))}
+            return {
+                "ok": True,
+                "path": self._to_workspace_rel(file_path),
+                "bytes": len(content.encode("utf-8")),
+                "deprecated": True,
+                "hint": "write_file is deprecated; prefer create_file/edit_file.",
+            }
+        result = self.create_file(path=path, content=content, overwrite=True)
+        result["deprecated"] = True
+        result["hint"] = "write_file is deprecated; prefer create_file/edit_file."
+        return result
 
     def edit_file(
         self,
@@ -122,7 +177,11 @@ class WorkspaceTools:
 
         file_path = self._resolve(path)
         if not file_path.exists() or not file_path.is_file():
-            return {"ok": False, "error": f"file not found: {path}"}
+            return {
+                "ok": False,
+                "error": f"file not found: {path}",
+                "hint": "Create the file first with create_file(path, content), then call edit_file.",
+            }
 
         original = file_path.read_text(encoding="utf-8", errors="replace")
         if find_text not in original:
@@ -137,6 +196,106 @@ class WorkspaceTools:
 
         write_text(file_path, updated)
         return {"ok": True, "path": self._to_workspace_rel(file_path), "replacements": replacements}
+
+    def search_project(
+        self,
+        query: str,
+        path: str = ".",
+        glob: str = "**/*",
+        case_sensitive: bool = False,
+        regex: bool = False,
+        max_matches: int = 200,
+    ) -> dict[str, Any]:
+        base = self._resolve(path)
+        if not base.exists():
+            return {"ok": False, "error": f"path not found: {path}"}
+        if not base.is_dir():
+            return {"ok": False, "error": f"not a directory: {path}"}
+        q = (query or "").strip()
+        if not q:
+            return {"ok": False, "error": "query must not be empty"}
+
+        limit = max(1, min(int(max_matches), 1000))
+        rel_base = self._to_workspace_rel(base)
+
+        if shutil.which("rg"):
+            cmd = ["rg", "--json", "--line-number", "--color", "never", "--max-count", str(limit)]
+            if not case_sensitive:
+                cmd.append("-i")
+            if not regex:
+                cmd.append("-F")
+            if glob and glob != "**/*":
+                cmd.extend(["-g", glob])
+            cmd.extend([q, str(base)])
+            try:
+                proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+                matches: list[dict[str, Any]] = []
+                for line in proc.stdout.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except Exception:
+                        continue
+                    if item.get("type") != "match":
+                        continue
+                    data = item.get("data", {})
+                    path_text = str(data.get("path", {}).get("text", "")).strip()
+                    line_num = int(data.get("line_number", 0) or 0)
+                    text_data = data.get("lines", {}).get("text", "")
+                    text_val = str(text_data).rstrip("\n")
+                    if not path_text:
+                        continue
+                    try:
+                        rel = self._to_workspace_rel(Path(path_text))
+                    except Exception:
+                        rel = path_text
+                    matches.append({"path": rel, "line": line_num, "text": text_val})
+                    if len(matches) >= limit:
+                        break
+                return {
+                    "ok": True,
+                    "engine": "rg",
+                    "query": q,
+                    "path": rel_base,
+                    "count": len(matches),
+                    "matches": matches,
+                }
+            except Exception:
+                pass
+
+        # Python fallback search
+        flags = 0 if case_sensitive else re.IGNORECASE
+        pattern = re.compile(q, flags=flags) if regex else None
+        matches: list[dict[str, Any]] = []
+        for p in base.glob(glob.strip() or "**/*"):
+            if len(matches) >= limit:
+                break
+            if not p.is_file():
+                continue
+            try:
+                raw = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if "\x00" in raw:
+                continue
+            for i, line in enumerate(raw.splitlines(), start=1):
+                hit = bool(pattern.search(line)) if pattern else (q in line if case_sensitive else q.lower() in line.lower())
+                if not hit:
+                    continue
+                matches.append({"path": self._to_workspace_rel(p), "line": i, "text": line[:400]})
+                if len(matches) >= limit:
+                    break
+
+        return {
+            "ok": True,
+            "engine": "python",
+            "query": q,
+            "path": rel_base,
+            "count": len(matches),
+            "matches": matches,
+        }
 
     def _plan_path(self, plan_id: str) -> Path:
         return self.plans_dir / f"{slugify(plan_id)}.json"
