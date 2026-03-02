@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
+import subprocess
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -12,6 +14,60 @@ from urllib.request import Request, urlopen
 from .utils import get_env_bool as _env_bool
 from .utils import get_env_float as _env_float
 from .utils import get_env_int as _env_int
+
+
+# Fix for macOS DNS resolution issue - use nslookup as fallback
+_dns_cache: dict[str, str] = {}
+
+def _resolve_hostname(hostname: str) -> str:
+    """Resolve hostname with fallback to nslookup."""
+    if hostname in _dns_cache:
+        return _dns_cache[hostname]
+    
+    # Try standard resolution first
+    try:
+        ip = socket.gethostbyname(hostname)
+        _dns_cache[hostname] = ip
+        return ip
+    except socket.gaierror:
+        pass
+    
+    # Fallback to nslookup
+    try:
+        result = subprocess.run(
+            ["nslookup", hostname],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        for line in result.stdout.split('\n'):
+            if 'Address:' in line and not line.startswith('Server:'):
+                parts = line.split()
+                if parts:
+                    ip = parts[-1]
+                    if '.' in ip and all(p.isdigit() for p in ip.split('.')):
+                        _dns_cache[hostname] = ip
+                        return ip
+    except Exception:
+        pass
+    
+    # If all fails, return original hostname
+    return hostname
+
+# Patch socket.getaddrinfo to use our DNS resolver
+_original_getaddrinfo = socket.getaddrinfo
+def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    """Patch getaddrinfo to handle DNS resolution failures."""
+    try:
+        return _original_getaddrinfo(host, port, family, type, proto, flags)
+    except socket.gaierror:
+        # Try resolving with our fallback
+        resolved_host = _resolve_hostname(host)
+        if resolved_host != host:
+            return _original_getaddrinfo(resolved_host, port, family, type, proto, flags)
+        raise
+
+socket.getaddrinfo = _patched_getaddrinfo
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -152,6 +208,18 @@ class BaseModel:
         return False, "model does not support auto limit tuning"
 
     def get_auto_limits(self) -> dict[str, Any] | None:
+        return None
+
+    def set_temperature(self, value: float) -> tuple[bool, str]:
+        return False, "model does not support dynamic temperature changes"
+
+    def get_temperature(self) -> float | None:
+        return None
+
+    def set_top_p(self, value: float) -> tuple[bool, str]:
+        return False, "model does not support dynamic top_p changes"
+
+    def get_top_p(self) -> float | None:
         return None
 
     @staticmethod
@@ -510,6 +578,7 @@ class OpenRouterModel(BaseModel):
             self.stream_mode = "auto"
         self.stream_timeout = _env_int("ASSISTANT_STREAM_TIMEOUT", 35)
         self.temperature = _env_float("ASSISTANT_TEMPERATURE", 0.2)
+        self.top_p = _env_float("ASSISTANT_TOP_P", 0.95)
         self.context_window = int(context_window) if isinstance(context_window, int) and context_window > 0 else None
         self.auto_limits = os.getenv("ASSISTANT_AUTO_LIMITS", "1").strip().lower() not in {"0", "false", "off"}
         user_pred_raw = os.getenv("ASSISTANT_NUM_PREDICT", "").strip()
@@ -587,6 +656,32 @@ class OpenRouterModel(BaseModel):
             return dict(snapshot)
         return None
 
+    def set_temperature(self, value: float) -> tuple[bool, str]:
+        try:
+            temp = float(value)
+            if temp < 0.0 or temp > 2.0:
+                return False, "temperature must be between 0.0 and 2.0"
+            self.temperature = temp
+            return True, f"openrouter temperature set to {temp}"
+        except (ValueError, TypeError):
+            return False, "invalid temperature value (must be a number)"
+
+    def get_temperature(self) -> float | None:
+        return self.temperature
+
+    def set_top_p(self, value: float) -> tuple[bool, str]:
+        try:
+            top_p = float(value)
+            if top_p < 0.0 or top_p > 1.0:
+                return False, "top_p must be between 0.0 and 1.0"
+            self.top_p = top_p
+            return True, f"openrouter top_p set to {top_p}"
+        except (ValueError, TypeError):
+            return False, "invalid top_p value (must be a number)"
+
+    def get_top_p(self) -> float | None:
+        return self.top_p
+
     def _headers(self) -> dict[str, str]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -644,6 +739,7 @@ class OpenRouterModel(BaseModel):
             "messages": messages,
             "stream": stream,
             "temperature": self.temperature,
+            "top_p": self.top_p,
         }
         if self.max_tokens > 0:
             payload["max_tokens"] = self.max_tokens
@@ -842,7 +938,7 @@ class GoogleModel(BaseModel):
             self.stream_mode = "auto"
         self.stream_timeout = _env_int("ASSISTANT_STREAM_TIMEOUT", 35)
         self.temperature = _env_float("ASSISTANT_TEMPERATURE", 0.2)
-        self.max_tokens = _env_int("ASSISTANT_NUM_PREDICT", 8192)
+        self.max_tokens = _env_int("ASSISTANT_NUM_PREDICT", 16384)
 
     def set_max_output_tokens(self, value: int) -> tuple[bool, str]:
         if value <= 0:
@@ -939,40 +1035,93 @@ class GoogleModel(BaseModel):
             "contents": alt_messages,
             "generationConfig": {
                 "temperature": self.temperature,
-            }
+            },
         }
         if self.max_tokens > 0:
             payload["generationConfig"]["maxOutputTokens"] = self.max_tokens
-        
-        # experimental thinking level if model supports it
-        if "thinking" in self.model_name.lower():
-            payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "HIGH"}
+
+        # Enable Gemini thinking output for all Google models.
+        # The Gemini API silently ignores thinkingConfig on models that don't
+        # support it, so this is safe.  Thinking output surfaces as <think>…</think>
+        # in the stream and is rendered in the CLI by StreamRenderer.
+        payload["generationConfig"]["thinkingConfig"] = {
+            "thinkingBudget": -1,       # let the model decide how much to think
+            "includeThoughts": True,
+        }
 
         return payload
 
     @staticmethod
     def _extract_final_text(data: dict[str, Any]) -> str:
+        """
+        Extract final text from a Gemini response.
+
+        For thinking-enabled models, reasoning summaries are returned in parts
+        with thought=true. We wrap those in <think>...</think> and append the
+        normal answer content after.
+        """
         candidates = data.get("candidates", [])
         if not candidates:
             return ""
         first = candidates[0]
-        content = first.get("content", {})
-        parts = content.get("parts", [])
-        if parts:
-            return _message_content_to_text(parts[0].get("text", ""))
-        return ""
+        content = first.get("content", {}) or {}
+        parts = content.get("parts", []) or []
+        if not isinstance(parts, list) or not parts:
+            return ""
+
+        reasoning_chunks: list[str] = []
+        answer_chunks: list[str] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            text = _message_content_to_text(part.get("text", ""))
+            if not text:
+                continue
+            if part.get("thought") is True:
+                reasoning_chunks.append(text)
+            else:
+                answer_chunks.append(text)
+
+        reasoning = "".join(reasoning_chunks)
+        answer = "".join(answer_chunks)
+        out = ""
+        if reasoning:
+            out += f"<think>{reasoning}</think>"
+        if answer:
+            out += answer
+        return out
 
     @staticmethod
-    def _extract_stream_delta(data: dict[str, Any]) -> str:
+    def _extract_stream_delta(data: dict[str, Any]) -> tuple[str, str]:
+        """
+        Extract incremental reasoning/content chunks from a streaming response.
+
+        Returns (thinking, content) where each is a string chunk that may be
+        empty. For non-thinking models, thinking will always be empty.
+        """
         candidates = data.get("candidates", [])
         if not candidates:
-            return ""
+            return "", ""
         first = candidates[0]
-        content = first.get("content", {})
-        parts = content.get("parts", [])
-        if parts:
-            return _message_content_to_text(parts[0].get("text", ""))
-        return ""
+        content = first.get("content", {}) or {}
+        parts = content.get("parts", []) or []
+        if not isinstance(parts, list) or not parts:
+            return "", ""
+
+        reasoning_chunks: list[str] = []
+        answer_chunks: list[str] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            text = _message_content_to_text(part.get("text", ""))
+            if not text:
+                continue
+            if part.get("thought") is True:
+                reasoning_chunks.append(text)
+            else:
+                answer_chunks.append(text)
+
+        return "".join(reasoning_chunks), "".join(answer_chunks)
 
     def is_available(self) -> bool:
         if not self.api_key:
@@ -1015,9 +1164,250 @@ class GoogleModel(BaseModel):
         payload = self._chat_payload(messages)
         path = f"/{self.model_name}:streamGenerateContent?alt=sse&key={self.api_key}"
         emitted = False
+        in_think = False
         try:
             for data in self._stream_post_json(path, payload, timeout=self.stream_timeout):
-                content = self._extract_stream_delta(data)
+                thinking, content = self._extract_stream_delta(data)
+                if thinking:
+                    if not in_think:
+                        yield "<think>"
+                        in_think = True
+                    yield thinking
+                    emitted = True
+                if content:
+                    if in_think:
+                        yield "</think>"
+                        in_think = False
+                    yield content
+                    emitted = True
+            if in_think:
+                yield "</think>"
+            if not emitted:
+                yield from self._stream_text(self.generate(messages))
+        except HTTPError as e:
+            if in_think:
+                yield "</think>"
+            err_msg = e.read().decode("utf-8", errors="ignore")
+            yield from self._stream_text(f"Google stream failed: HTTP Error {e.code} {err_msg}")
+        except Exception as e:
+            if in_think:
+                yield "</think>"
+            fallback_text = self.generate(messages)
+            if "Google request failed" in fallback_text:
+                fallback_text = f"Google stream failed: {e}. {fallback_text}"
+            yield from self._stream_text(fallback_text)
+
+
+class NvidiaModel(BaseModel):
+    def __init__(
+        self,
+        model_name: str,
+        api_key: str,
+        base_url: str = "https://integrate.api.nvidia.com/v1",
+        timeout: int = 120,
+    ) -> None:
+        self.model_name = model_name
+        self.api_key = api_key.strip()
+        self.base_url = base_url.rstrip("/")
+        self.endpoint = self.base_url
+        self.provider = "nvidia"
+        self.timeout = timeout
+        self.native_streaming = True
+        self.connect_log = []
+        self.stream_mode = os.getenv("ASSISTANT_STREAM_MODE", "auto").strip().lower()
+        if self.stream_mode not in {"auto", "native", "chunk"}:
+            self.stream_mode = "auto"
+        self.stream_timeout = _env_int("ASSISTANT_STREAM_TIMEOUT", 35)
+        self.temperature = _env_float("ASSISTANT_TEMPERATURE", 0.2)
+        self.top_p = _env_float("ASSISTANT_TOP_P", 0.95)
+        self.max_tokens = _env_int("ASSISTANT_NUM_PREDICT", 16384)
+        self.enable_reasoning = _env_bool("NVIDIA_ENABLE_REASONING", True)
+
+    def set_max_output_tokens(self, value: int) -> tuple[bool, str]:
+        if value <= 0:
+            return False, "max output tokens must be > 0"
+        self.max_tokens = int(value)
+        return True, f"nvidia max_tokens set to {self.max_tokens}"
+
+    def get_max_output_tokens(self) -> int | None:
+        return int(self.max_tokens) if isinstance(self.max_tokens, int) else None
+
+    def get_context_window(self) -> int | None:
+        return None
+
+    def set_stream_mode(self, mode: str) -> tuple[bool, str]:
+        m = (mode or "").strip().lower()
+        if m not in {"auto", "native", "chunk"}:
+            return False, "stream mode must be one of: auto, native, chunk"
+        self.stream_mode = m
+        return True, f"nvidia stream mode set to {m}"
+
+    def get_stream_mode(self) -> str:
+        return self.stream_mode
+
+    def apply_auto_limits(self) -> tuple[bool, str]:
+        return True, "nvidia auto limits ignored"
+
+    def get_auto_limits(self) -> dict[str, Any] | None:
+        return None
+
+    def set_temperature(self, value: float) -> tuple[bool, str]:
+        try:
+            temp = float(value)
+            if temp < 0.0 or temp > 2.0:
+                return False, "temperature must be between 0.0 and 2.0"
+            self.temperature = temp
+            return True, f"nvidia temperature set to {temp}"
+        except (ValueError, TypeError):
+            return False, "invalid temperature value (must be a number)"
+
+    def get_temperature(self) -> float | None:
+        return self.temperature
+
+    def set_top_p(self, value: float) -> tuple[bool, str]:
+        try:
+            top_p = float(value)
+            if top_p < 0.0 or top_p > 1.0:
+                return False, "top_p must be between 0.0 and 1.0"
+            self.top_p = top_p
+            return True, f"nvidia top_p set to {top_p}"
+        except (ValueError, TypeError):
+            return False, "invalid top_p value (must be a number)"
+
+    def get_top_p(self) -> float | None:
+        return self.top_p
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8")
+        req = Request(
+            f"{self.base_url}{path}",
+            data=body,
+            headers=self._headers(),
+            method="POST",
+        )
+        with urlopen(req, timeout=self.timeout) as resp:  # nosec B310
+            raw = resp.read().decode("utf-8")
+        return json.loads(raw)
+
+    def _stream_post_json(self, path: str, payload: dict[str, Any], timeout: int | None = None) -> Iterator[dict[str, Any]]:
+        body = json.dumps(payload).encode("utf-8")
+        req = Request(
+            f"{self.base_url}{path}",
+            data=body,
+            headers=self._headers(),
+            method="POST",
+        )
+        req.add_header("Accept", "text/event-stream")
+        effective_timeout = timeout if isinstance(timeout, int) and timeout > 0 else self.timeout
+        with urlopen(req, timeout=effective_timeout) as resp:  # nosec B310
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+                if line.startswith("event:"):
+                    continue
+                if line.startswith("data:"):
+                    data_chunk = line[5:].strip()
+                    if data_chunk == "[DONE]":
+                        break
+                else:
+                    data_chunk = line
+                try:
+                    yield json.loads(data_chunk)
+                except json.JSONDecodeError:
+                    continue
+
+    def _chat_payload(self, messages: list[dict[str, str]], stream: bool) -> dict[str, Any]:
+        compatible_messages = []
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            if role == "tool":
+                role = "user"
+                content = f"[System: Tool Execution Result]\n{content}"
+            compatible_messages.append({"role": role, "content": content})
+
+        payload: dict[str, Any] = {
+            "model": self.model_name,
+            "messages": compatible_messages,
+            "stream": stream,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+        }
+        if self.max_tokens > 0:
+            payload["max_tokens"] = self.max_tokens
+        if self.enable_reasoning:
+            payload["chat_template_kwargs"] = {"enable_thinking": True}
+        return payload
+
+    @staticmethod
+    def _extract_final_text(data: dict[str, Any]) -> str:
+        choices = data.get("choices", [])
+        if not choices:
+            return ""
+        first = choices[0]
+        message = first.get("message", {})
+        content = _message_content_to_text(message.get("content", ""))
+        return content
+
+    @staticmethod
+    def _extract_stream_delta(data: dict[str, Any]) -> tuple[str, str]:
+        choices = data.get("choices", [])
+        if not choices:
+            return "", ""
+        delta = choices[0].get("delta", {})
+        content = _message_content_to_text(delta.get("content", ""))
+        return "", content
+
+    def is_available(self) -> bool:
+        if not self.api_key:
+            return False
+        try:
+            req = Request(
+                f"{self.base_url}/models",
+                headers=self._headers(),
+                method="GET",
+            )
+            with urlopen(req, timeout=8):  # nosec B310
+                return True
+        except Exception:
+            return False
+
+    def generate(self, messages: list[dict[str, str]]) -> str:
+        if not self.api_key:
+            return "Nvidia API key missing. Set NVIDIA_API_KEY."
+        payload = self._chat_payload(messages, stream=False)
+        try:
+            data = self._post_json("/chat/completions", payload)
+            text = self._extract_final_text(data)
+            return text or "Nvidia returned an empty response."
+        except HTTPError as e:
+            err_msg = e.read().decode("utf-8", errors="ignore")
+            return f"Nvidia request failed: HTTP Error {e.code}: {err_msg}"
+        except Exception as e:
+            return f"Nvidia request failed: {e}"
+
+    def stream_generate(self, messages: list[dict[str, str]]) -> Iterator[str]:
+        if not self.api_key:
+            yield "Nvidia API key missing. Set NVIDIA_API_KEY."
+            return
+
+        if self.stream_mode == "chunk":
+            yield from self._stream_text(self.generate(messages))
+            return
+
+        payload = self._chat_payload(messages, stream=True)
+        emitted = False
+        try:
+            for data in self._stream_post_json("/chat/completions", payload, timeout=self.stream_timeout):
+                _, content = self._extract_stream_delta(data)
                 if content:
                     yield content
                     emitted = True
@@ -1025,11 +1415,11 @@ class GoogleModel(BaseModel):
                 yield from self._stream_text(self.generate(messages))
         except HTTPError as e:
             err_msg = e.read().decode("utf-8", errors="ignore")
-            yield from self._stream_text(f"Google stream failed: HTTP Error {e.code} {err_msg}")
+            yield from self._stream_text(f"Nvidia stream failed: HTTP Error {e.code} {err_msg}")
         except Exception as e:
             fallback_text = self.generate(messages)
-            if "Google request failed" in fallback_text:
-                fallback_text = f"Google stream failed: {e}. {fallback_text}"
+            if "Nvidia request failed" in fallback_text:
+                fallback_text = f"Nvidia stream failed: {e}. {fallback_text}"
             yield from self._stream_text(fallback_text)
 
 
@@ -1156,14 +1546,28 @@ def build_model(
     openrouter_url: str = "https://openrouter.ai/api/v1",
     openrouter_api_key: str | None = None,
     google_api_key: str | None = None,
+    nvidia_api_key: str | None = None,
 ) -> BaseModel:
     provider_key = (provider or "auto").strip().lower()
-    if provider_key not in {"auto", "ollama", "openrouter", "google"}:
+    if provider_key not in {"auto", "ollama", "openrouter", "google", "nvidia"}:
         provider_key = "auto"
 
     api_key = (openrouter_api_key or os.getenv("OPENROUTER_API_KEY", "")).strip()
     g_api_key = (google_api_key or os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", ""))).strip()
+    n_api_key = (nvidia_api_key or os.getenv("NVIDIA_API_KEY", "")).strip()
     connect_log: list[str] = []
+
+    if provider_key == "nvidia":
+        if not n_api_key:
+            connect_log.append("[fail] nvidia api key missing")
+            fb = FallbackModel(reason="NVIDIA_API_KEY missing")
+            fb.connect_log = connect_log
+            return fb
+        connect_log.append("[try] nvidia")
+        nvidia_model = NvidiaModel(model_name=model_name, api_key=n_api_key)
+        connect_log.append(f"[ok] nvidia connected, model={model_name}")
+        nvidia_model.connect_log = connect_log
+        return nvidia_model
 
     if provider_key == "google":
         if not g_api_key:
@@ -1313,6 +1717,14 @@ def build_model(
         return google_model
     else:
         connect_log.append("[skip] auto google (api key missing)")
-    fb = FallbackModel(reason="No available backend (Ollama/OpenRouter/Google)")
+    if n_api_key:
+        connect_log.append("[try] auto->nvidia")
+        nvidia_model = NvidiaModel(model_name=model_name, api_key=n_api_key)
+        connect_log.append(f"[ok] auto selected nvidia, model={model_name}")
+        nvidia_model.connect_log = connect_log
+        return nvidia_model
+    else:
+        connect_log.append("[skip] auto nvidia (api key missing)")
+    fb = FallbackModel(reason="No available backend (Ollama/OpenRouter/Google/Nvidia)")
     fb.connect_log = connect_log
     return fb

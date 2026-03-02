@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 from collections.abc import Callable
 
-from .cli_format import StreamRenderer, extract_answer_text, print_answer_only, print_formatted_output, print_tool_event, print_tool_start
+from .cli_format import StreamRenderer, extract_answer_text, print_answer_only, print_formatted_output, print_phase, print_tool_event, print_tool_start
 from .model import BaseModel
 from .tool_calls import parse_tool_calls
 from .tools import ToolSystem
@@ -45,6 +45,18 @@ class ChatEngine:
         self.compact_context_enabled = get_env_bool("ASSISTANT_COMPACT_CONTEXT", True)
         self.max_context_chars = get_env_int("ASSISTANT_MAX_CONTEXT_CHARS", 180000)
         self.compacted_context_note = ""
+        # Set to a callable (e.g. cli_format.print_phase) to display internal
+        # phase labels in the CLI.  Left as None in server mode to stay silent.
+        self.on_status: Callable[[str], None] | None = None
+
+    def _status(self, label: str) -> None:
+        """Call on_status callback if configured (CLI mode only)."""
+        if self.on_status is not None:
+            try:
+                self.on_status(label)
+            except Exception:
+                pass
+
 
     def _generate_with_stream_fallback(self, messages: list[dict[str, str]]) -> str:
         text = self.model.generate(messages)
@@ -66,6 +78,7 @@ class ChatEngine:
         return cleaned.strip()
 
     def _recover_final_answer(self, raw_assistant_text: str) -> tuple[str, str] | None:
+        self._status("recovering final answer from model output…")
         recovery_messages = self._messages() + [
             {"role": "assistant", "content": raw_assistant_text},
             {
@@ -83,6 +96,7 @@ class ChatEngine:
         return None
 
     def _recover_action_or_answer(self, user_message: str, raw_assistant_text: str) -> tuple[str, list[dict[str, object]], str]:
+        self._status("recovering action or answer…")
         recovery_messages = self._messages() + [
             {"role": "assistant", "content": raw_assistant_text},
             {
@@ -133,6 +147,7 @@ class ChatEngine:
         return any(p in t for p in patterns)
 
     def _recover_tool_calls(self, user_message: str, raw_assistant_text: str) -> list[dict[str, object]]:
+        self._status("recovering tool calls (model denied tools)…")
         recovery_messages = self._messages() + [
             {"role": "assistant", "content": raw_assistant_text},
             {
@@ -480,6 +495,7 @@ class ChatEngine:
             return self._intent_cache[key]
 
         heuristic = self._heuristic_intent_flags(user_message)
+        self._status("classifying intent…")
         ai = self._ai_intent_flags(user_message)
         merged = dict(heuristic)
         for k, v in ai.items():
@@ -776,8 +792,9 @@ class ChatEngine:
     def handle_turn(
         self,
         user_message: str,
-        on_tool: Callable[[str, dict[str, object], dict[str, object]], None] | None = None,
-        on_tool_start: Callable[[str, dict[str, object]], None] | None = None,
+        on_tool: Optional[Callable[[str, Dict[str, Any], Any], None]] = None,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        on_tool_start: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         enforce_presearch: bool = True,
     ) -> str:
         self.history.append({"role": "user", "content": user_message})
@@ -797,7 +814,14 @@ class ChatEngine:
                         require_file_tools=self._requires_workspace_preinspect(user_message),
                     )
                 ]
-            assistant_text = self.model.generate(messages)
+            assistant_text = ""
+            if on_chunk:
+                for chunk in self.model.stream_generate(messages):
+                    if chunk:
+                        assistant_text += chunk
+                        on_chunk(chunk)
+            else:
+                assistant_text = self.model.generate(messages)
             tool_calls = parse_tool_calls(assistant_text)
             if not tool_calls and self._contains_tool_denial(self._strip_thinking(assistant_text)):
                 self._log_supervision("tool_denial_detected", user_message, assistant_text)
@@ -862,12 +886,15 @@ class ChatEngine:
                     presearch: list[dict[str, Any]] = []
                     event_name = ""
                     if enforce_presearch and clean and self._requires_workspace_preinspect(user_message) and not tools_executed_this_turn:
+                        self._status("pre-inspecting workspace…")
                         presearch = self._preinspect_tool_calls_for_workspace(user_message)
                         event_name = "workspace_preinspect"
                     elif enforce_presearch and clean and self._requires_presearch_for_code(user_message) and not tools_executed_this_turn:
+                        self._status("pre-searching for code context…")
                         presearch = self._presearch_tool_calls_for_code(user_message)
                         event_name = "presearch_for_code"
                     elif enforce_presearch and clean and self._requires_web_presearch_for_factual(user_message) and not web_search_executed_this_turn:
+                        self._status("pre-searching web for factual context…")
                         presearch = self._presearch_tool_calls_for_factual(user_message)
                         event_name = "presearch_for_factual"
                     if presearch:
@@ -1035,12 +1062,15 @@ class ChatEngine:
                     presearch: list[dict[str, Any]] = []
                     event_name = ""
                     if enforce_presearch and clean and self._requires_workspace_preinspect(user_message) and not tools_executed_this_turn:
+                        self._status("pre-inspecting workspace…")
                         presearch = self._preinspect_tool_calls_for_workspace(user_message)
                         event_name = "workspace_preinspect"
                     elif enforce_presearch and clean and self._requires_presearch_for_code(user_message) and not tools_executed_this_turn:
+                        self._status("pre-searching for code context…")
                         presearch = self._presearch_tool_calls_for_code(user_message)
                         event_name = "presearch_for_code"
                     elif enforce_presearch and clean and self._requires_web_presearch_for_factual(user_message) and not web_search_executed_this_turn:
+                        self._status("pre-searching web for factual context…")
                         presearch = self._presearch_tool_calls_for_factual(user_message)
                         event_name = "presearch_for_factual"
                     if presearch:
@@ -1098,13 +1128,15 @@ class ChatEngine:
         return final_text
 
     def run_cli(self) -> None:
+        # Enable phase status messages for CLI mode
+        self.on_status = print_phase
+
         print("Local Coding Assistant")
         print("Type 'exit' or 'quit' to stop.")
         print(
-            "Commands: /reset, /status, /maxout <n>, /maxout, /ctx <n>, /ctx, "
-            "/autosize [apply|status], /stream <auto|native|chunk>, /stream, /compact [on|off|status]"
+            "Commands: /reset, /status, /maxout <n>, /stream, /temperature <n>, /top_p <n>, /compact, /autosize"
         )
-        print("Autonomous: /auto, /auto on [steps|infinite], /auto off")
+        print("More help: /help")
 
         if self.autonomous_enabled:
             steps_text = "infinite" if self.autonomous_steps <= 0 else str(self.autonomous_steps)
@@ -1190,6 +1222,32 @@ class ChatEngine:
                     ok, msg = setter(parts[1])
                     print(msg)
                     continue
+                if cmd == "/temperature":
+                    if len(parts) == 1:
+                        getter = getattr(self.model, "get_temperature", None)
+                        temp = getter() if callable(getter) else "unknown"
+                        print(f"temperature: {temp}")
+                        continue
+                    setter = getattr(self.model, "set_temperature", None)
+                    if not callable(setter):
+                        print("this model does not support temperature changes")
+                        continue
+                    ok, msg = setter(parts[1])
+                    print(msg)
+                    continue
+                if cmd == "/top_p" or cmd == "/topp":
+                    if len(parts) == 1:
+                        getter = getattr(self.model, "get_top_p", None)
+                        top_p = getter() if callable(getter) else "unknown"
+                        print(f"top_p: {top_p}")
+                        continue
+                    setter = getattr(self.model, "set_top_p", None)
+                    if not callable(setter):
+                        print("this model does not support top_p changes")
+                        continue
+                    ok, msg = setter(parts[1])
+                    print(msg)
+                    continue
                 if cmd == "/compact":
                     if len(parts) == 1 or parts[1].lower() == "status":
                         mode = "on" if self.compact_context_enabled else "off"
@@ -1255,6 +1313,10 @@ class ChatEngine:
                     print("- /autosize status")
                     print("- /stream <auto|native|chunk>   set stream mode")
                     print("- /stream       show current stream mode")
+                    print("- /temperature <n>   set temperature (0.0-2.0)")
+                    print("- /temperature       show current temperature")
+                    print("- /top_p <n>    set top_p (0.0-1.0)")
+                    print("- /top_p        show current top_p")
                     print("- /compact [on|off|status]")
                     print("- /auto         show autonomous status")
                     print("- /auto on [steps|infinite] / /auto off")

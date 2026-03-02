@@ -47,6 +47,7 @@ def build_engine(
     openrouter_url: str,
     openrouter_api_key: str | None,
     google_api_key: str | None = None,
+    nvidia_api_key: str | None = None,
     autonomous_enabled: bool = False,
     autonomous_steps: int = 6,
 ) -> ChatEngine:
@@ -67,6 +68,7 @@ def build_engine(
         openrouter_url=openrouter_url,
         openrouter_api_key=openrouter_api_key,
         google_api_key=google_api_key,
+        nvidia_api_key=nvidia_api_key,
     )
 
     return ChatEngine(
@@ -119,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--provider",
         default=os.getenv("ASSISTANT_PROVIDER", "openrouter"),
-        choices=["auto", "ollama", "openrouter", "google"],
+        choices=["auto", "ollama", "openrouter", "google", "nvidia"],
         help="Model backend provider",
     )
     parser.add_argument(
@@ -141,6 +143,11 @@ def parse_args() -> argparse.Namespace:
         "--google-api-key",
         default=os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", "")),
         help="Google AI Studio API key (or use GEMINI_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--nvidia-api-key",
+        default=os.getenv("NVIDIA_API_KEY", ""),
+        help="Nvidia API key",
     )
     parser.add_argument(
         "--list-models",
@@ -169,12 +176,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose logging to stderr",
     )
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Start the OpenAI-compatible API server",
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host for the API server",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port for the API server",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     load_dotenv()
     args = parse_args()
+    if args.server and not os.getenv("ASSISTANT_LOG_FILE"):
+        os.environ["ASSISTANT_LOG_FILE"] = "log.txt"
     setup_logging(verbose=args.verbose)
     if args.list_models:
         models = list_openrouter_models(
@@ -196,11 +221,17 @@ def main() -> None:
         openrouter_url=args.openrouter_url,
         openrouter_api_key=args.openrouter_api_key,
         google_api_key=args.google_api_key,
+        nvidia_api_key=args.nvidia_api_key,
         autonomous_enabled=args.autonomous,
         autonomous_steps=args.autonomous_steps,
     )
     print_model_connection_info(engine)
     print("")
+
+    if args.server:
+        from assistant.server import start_server
+        start_server(engine, host=args.host, port=args.port)
+        return
 
     if args.once:
         response = engine.handle_turn(args.once, print_tool_event)

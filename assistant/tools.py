@@ -35,6 +35,9 @@ class ToolSystem:
             "list_files": self.list_files,
             "read_file": self.read_file,
             "create_file": self.create_file,
+            "create_folder": self.create_folder,
+            "delete_file": self.delete_file,
+            "run_terminal": self.run_terminal,
             "write_file": self.write_file,
             "edit_file": self.edit_file,
             "search_project": self.search_project,
@@ -44,6 +47,7 @@ class ToolSystem:
             "add_todo": self.add_todo,
             "update_todo": self.update_todo,
             "get_current_datetime": self.get_current_datetime,
+            "run_function": self.run_function,
         }
 
     def tool_names(self) -> list[str]:
@@ -108,6 +112,21 @@ class ToolSystem:
             tool_name=tool_name,
             tool_args=tool_args,
             tool_calls=tool_calls,
+        )
+
+    def run_function(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        """
+        Execute a previously registered function.
+
+        For 'code' functions, args are passed as keyword arguments to the
+        underlying Python function whose name matches the slugified function
+        name. For 'tool_macro' functions, the saved tool_calls are replayed
+        using this ToolSystem's execute method.
+        """
+        return self.function_registry.execute_function(
+            name=name,
+            args=args or {},
+            execute_tool=self.execute,
         )
 
     @staticmethod
@@ -329,6 +348,15 @@ class ToolSystem:
 
     def create_file(self, path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
         return self.workspace_tools.create_file(path=path, content=content, overwrite=overwrite)
+
+    def create_folder(self, path: str) -> dict[str, Any]:
+        return self.workspace_tools.create_folder(path=path)
+
+    def delete_file(self, path: str) -> dict[str, Any]:
+        return self.workspace_tools.delete_file(path=path)
+
+    def run_terminal(self, action: str, cmd: str | None = None, session_id: str = "default") -> dict[str, Any]:
+        return self.workspace_tools.run_terminal(action=action, cmd=cmd, session_id=session_id)
 
     def write_file(self, path: str, content: str, append: bool = False) -> dict[str, Any]:
         # Backward-compatible alias.

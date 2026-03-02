@@ -45,6 +45,8 @@ Available tools:
 - list_files(path=".", glob="**/*", include_hidden=false, max_entries=200)
 - read_file(path, start_line=1, end_line?, max_chars=12000)
 - create_file(path, content, overwrite=false)
+- create_folder(path)
+- delete_file(path)
 - edit_file(path, find_text, replace_text, replace_all=false)
 - search_project(query, path=".", glob="**/*", case_sensitive=false, regex=false, max_matches=200)
 - create_plan(title, goal, steps)
@@ -52,6 +54,8 @@ Available tools:
 - get_plan(plan_id)
 - add_todo(plan_id, text)
 - update_todo(plan_id, todo_id, status)
+- run_terminal(action="start|send|read|close", cmd?, session_id="default")
+- run_function(name, args?)  # execute a previously created function (code or tool_macro)
 
 When tools are not needed, return normal text.
 For factual queries:

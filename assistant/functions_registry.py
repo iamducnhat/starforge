@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import hashlib
 import io
 import json
 import tokenize
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .utils import ensure_dir, normalize_keywords, read_json, slugify, utc_now_iso, write_json, write_text
 
@@ -31,6 +32,34 @@ class FunctionRegistry:
             except Exception:
                 continue
         return out
+
+    def _paths_for_name(self, name: str) -> tuple[Path, Path]:
+        """Return (py_path, meta_path) for a given logical function name."""
+        safe_name = slugify(name)
+        py_path = self.functions_dir / f"{safe_name}.py"
+        meta_path = self.functions_dir / f"{safe_name}.json"
+        return py_path, meta_path
+
+    def get_function_metadata(self, name: str) -> dict[str, Any] | None:
+        """
+        Look up function metadata by logical name.
+
+        First tries slug-based filename, then falls back to scanning all
+        metadata entries for a matching "name" field.
+        """
+        _py, meta_path = self._paths_for_name(name)
+        if meta_path.exists():
+            try:
+                meta = read_json(meta_path)
+                meta["_meta_path"] = str(meta_path)
+                return meta
+            except Exception:
+                pass
+
+        for item in self._list_metadata():
+            if str(item.get("name", "")).strip() == str(name).strip():
+                return item
+        return None
 
     def _normalize_code(self, code: str) -> str:
         """Normalize code for hashing by removing comments and whitespace variations."""
@@ -213,4 +242,81 @@ class FunctionRegistry:
             "code_hash": code_hash,
             "kind": kind,
             "tool_calls": normalized_tool_calls,
+        }
+
+    def _execute_code_function(self, name: str, args: dict[str, Any]) -> Any:
+        """
+        Execute a 'code' kind function by importing its module and calling
+        a callable that matches the slugified name.
+        """
+        py_path, _meta_path = self._paths_for_name(name)
+        if not py_path.exists():
+            raise FileNotFoundError(f"function implementation not found: {name}")
+
+        module_name = f"_assistant_function_{slugify(name)}"
+        spec = importlib.util.spec_from_file_location(module_name, py_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"could not load function module for: {name}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+
+        func_name = slugify(name)
+        fn = getattr(module, func_name, None)
+        if not callable(fn):
+            raise AttributeError(f"callable '{func_name}' not found in function module for: {name}")
+        return fn(**(args or {}))
+
+    def execute_function(
+        self,
+        name: str,
+        args: dict[str, Any] | None,
+        execute_tool: Callable[[str, dict[str, Any]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """
+        Execute a previously registered function by logical name.
+
+        For 'tool_macro' functions, this replays the saved tool_calls
+        in order, using the provided execute_tool callback.
+
+        For 'code' functions, this imports the Python module and calls
+        a function whose name matches the slugified function name,
+        passing args as keyword arguments.
+        """
+        metadata = self.get_function_metadata(name)
+        if not metadata:
+            return {"ok": False, "error": f"function not found: {name}"}
+
+        kind = metadata.get("kind", "code")
+        args = args or {}
+
+        if kind == "tool_macro":
+            calls = metadata.get("tool_calls", []) or []
+            if not isinstance(calls, list):
+                return {"ok": False, "error": f"invalid tool_calls metadata for function: {name}"}
+            results: list[dict[str, Any]] = []
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                tool = str(call.get("tool", "")).strip()
+                call_args = call.get("args", {})
+                if not isinstance(call_args, dict):
+                    call_args = {}
+                if not tool:
+                    continue
+                results.append(execute_tool(tool, call_args))
+            return {
+                "ok": True,
+                "kind": "tool_macro",
+                "results": results,
+            }
+
+        try:
+            result = self._execute_code_function(name, args)
+        except Exception as e:
+            return {"ok": False, "error": f"function execution failed: {e}"}
+
+        return {
+            "ok": True,
+            "kind": "code",
+            "result": result,
         }

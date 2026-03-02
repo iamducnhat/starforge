@@ -4,6 +4,9 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
+import queue
 import json
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,7 @@ class WorkspaceTools:
     def __init__(self, workspace_root: str | Path) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.plans_dir = self.workspace_root / "memory" / "plans"
+        self._terminals: dict[str, dict[str, Any]] = {}
         ensure_dir(self.plans_dir)
 
     def _resolve(self, path: str) -> Path:
@@ -145,6 +149,102 @@ class WorkspaceTools:
         write_text(file_path, content)
 
         return {"ok": True, "path": self._to_workspace_rel(file_path), "bytes": len(content.encode("utf-8"))}
+
+    def create_folder(self, path: str) -> dict[str, Any]:
+        folder_path = self._resolve(path)
+        if folder_path.exists():
+            return {"ok": False, "error": f"path already exists: {path}"}
+        
+        try:
+            ensure_dir(folder_path)
+            return {"ok": True, "path": self._to_workspace_rel(folder_path)}
+        except Exception as e:
+            return {"ok": False, "error": f"failed to create folder: {e}"}
+
+    def delete_file(self, path: str) -> dict[str, Any]:
+        target_path = self._resolve(path)
+        if not target_path.exists():
+            return {"ok": False, "error": f"path not found: {path}"}
+        
+        try:
+            if target_path.is_dir():
+                shutil.rmtree(target_path)
+            else:
+                target_path.unlink()
+            return {"ok": True, "path": self._to_workspace_rel(target_path), "deleted": True}
+        except Exception as e:
+            return {"ok": False, "error": f"failed to delete: {e}"}
+
+    def run_terminal(self, action: str, cmd: str | None = None, session_id: str = "default") -> dict[str, Any]:
+        actions = {"start", "send", "read", "close"}
+        if action not in actions:
+            return {"ok": False, "error": f"invalid action '{action}', must be one of {actions}"}
+
+        if action == "start":
+            if session_id in self._terminals:
+                return {"ok": False, "error": f"Session {session_id} already exists."}
+            
+            try:
+                proc = subprocess.Popen(
+                    ["/bin/bash"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    cwd=str(self.workspace_root)
+                )
+            except Exception as e:
+                return {"ok": False, "error": f"failed to start session: {e}"}
+
+            out_queue = queue.Queue()
+
+            def reader(pipe, q):
+                try:
+                    for line in iter(pipe.readline, ""):
+                        q.put(line)
+                except Exception:
+                    pass
+                finally:
+                    pipe.close()
+            
+            t = threading.Thread(target=reader, args=(proc.stdout, out_queue), daemon=True)
+            t.start()
+            self._terminals[session_id] = {"proc": proc, "queue": out_queue, "thread": t}
+            return {"ok": True, "session_id": session_id, "message": f"Started session: {session_id}"}
+
+        s = self._terminals.get(session_id)
+        if not s:
+            return {"ok": False, "error": f"Session {session_id} not found."}
+
+        if action == "send":
+            if not cmd:
+                return {"ok": False, "error": "No command provided for 'send' action."}
+            try:
+                # Add newline if not present
+                if not cmd.endswith("\n"):
+                    cmd += "\n"
+                s["proc"].stdin.write(cmd)
+                s["proc"].stdin.flush()
+                return {"ok": True, "session_id": session_id, "message": f"Sent command."}
+            except Exception as e:
+                return {"ok": False, "error": f"failed to send command: {e}"}
+
+        if action == "read":
+            lines = []
+            time.sleep(0.1)  # Brief wait for fast outputs
+            while not s["queue"].empty():
+                lines.append(s["queue"].get_nowait())
+            output = "".join(lines)
+            return {"ok": True, "session_id": session_id, "output": output if output else "[No new output]"}
+
+        if action == "close":
+            try:
+                s["proc"].terminate()
+                del self._terminals[session_id]
+                return {"ok": True, "session_id": session_id, "message": f"Closed session: {session_id}"}
+            except Exception as e:
+                return {"ok": False, "error": f"failed to close session: {e}"}
 
     def write_file(self, path: str, content: str, append: bool = False) -> dict[str, Any]:
         # Backward-compatible shim. Prefer create_file + edit_file in tool protocol.

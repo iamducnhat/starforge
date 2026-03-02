@@ -1,0 +1,13 @@
+{
+  "name": "execute_terminal_command",
+  "description": "Executes a shell command and returns stdout, stderr, and returncode.",
+  "keywords": [
+    "terminal",
+    "shell",
+    "execute"
+  ],
+  "version": "1.0.0",
+  "created_at": "2026-02-27T05:16:42+00:00",
+  "code_hash": "d14407ebfe68d548d2205b32f0cedcf55c2364cf3d65f510bbd5c3e5e602346e",
+  "kind": "code"
+}

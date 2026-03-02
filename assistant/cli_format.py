@@ -317,20 +317,62 @@ class StreamRenderer:
         self._ensure_newline()
 
 
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+
+
+def print_phase(label: str) -> None:
+    """
+    Print a dim one-liner showing an internal system process phase.
+
+    Used in CLI mode to make silent internal AI calls visible, e.g.:
+      ◆ 22:03:01  intent classification…
+      ◆ 22:03:02  pre-searching web for factual context…
+      ◆ 22:03:03  recovering action…
+    """
+    import time as _t
+    ts = _t.strftime("%H:%M:%S")
+    sys.stdout.write(f"{DIM}{CYAN}◆ {ts}  {label}{RESET}\n")
+    sys.stdout.flush()
+
+
+def _now_ts() -> str:
+    """HH:MM:SS timestamp for log lines."""
+    import time as _time
+    t = _time.localtime()
+    return f"{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}"
+
+
 def print_tool_event(name: str, args: dict[str, Any], result: dict[str, Any]) -> None:
     safe_args = redact_secrets_obj(args)
     safe_result = redact_secrets_obj(result)
+
+    # Compact args: single-line, truncated to 200 chars
     args_text = json.dumps(safe_args, ensure_ascii=False)
+    if len(args_text) > 200:
+        args_text = args_text[:197] + "…"
+
+    # Result: show ok/error indicator + truncated payload
+    ok = safe_result.get("ok", None) if isinstance(safe_result, dict) else None
+    status_icon = "✓" if ok is True else ("✗" if ok is False else "·")
     result_text = json.dumps(safe_result, ensure_ascii=False)
     if len(result_text) > 420:
-        result_text = result_text[:417] + "..."
-    print(f"{BOLD}{MAGENTA}tool>{RESET} {TOOL_LABEL}{name}{RESET}")
-    print(f"{DIM}{BLUE}args:{RESET} {args_text}")
-    print(f"{DIM}{BLUE}result:{RESET} {result_text}")
+        result_text = result_text[:417] + "…"
+
+    ts = _now_ts()
+    print(f"{DIM}{'─'*60}{RESET}")
+    print(f"{BOLD}{MAGENTA}[{ts}] tool ▶ {TOOL_LABEL}{name}{RESET}  {DIM}{status_icon}{RESET}")
+    print(f"  {DIM}{BLUE}args   :{RESET} {args_text}")
+    print(f"  {DIM}{BLUE}result :{RESET} {result_text}")
 
 
 def print_tool_start(name: str, args: dict[str, Any]) -> None:
     safe_args = redact_secrets_obj(args)
     args_text = json.dumps(safe_args, ensure_ascii=False)
-    print(f"{BOLD}{MAGENTA}tool>{RESET} {TOOL_LABEL}{name}{RESET} {DIM}(start){RESET}")
-    print(f"{DIM}{BLUE}args:{RESET} {args_text}")
+    if len(args_text) > 200:
+        args_text = args_text[:197] + "…"
+    ts = _now_ts()
+    print(f"{DIM}{'─'*60}{RESET}")
+    print(f"{BOLD}{MAGENTA}[{ts}] tool ▶ {TOOL_LABEL}{name}{RESET}  {DIM}(starting…){RESET}")
+    print(f"  {DIM}{BLUE}args   :{RESET} {args_text}")
+
