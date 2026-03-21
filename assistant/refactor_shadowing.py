@@ -1,6 +1,8 @@
-import ast, re
+import ast
+import re
 from collections import defaultdict
 from typing import Dict, List, Tuple
+
 
 def _collect_assigned_names(node: ast.AST, scope: Dict[str, int]) -> List[str]:
     assigned = []
@@ -36,21 +38,37 @@ def _collect_assigned_names(node: ast.AST, scope: Dict[str, int]) -> List[str]:
         assigned.extend(_collect_assigned_names(child, scope))
     return assigned
 
-def _detect_shadowing(func_code: str) -> Tuple[Dict[str, List[str]], List[Tuple[int, str, str]]]:
+
+def _detect_shadowing(
+    func_code: str,
+) -> Tuple[Dict[str, List[str]], List[Tuple[int, str, str]]]:
     tree = ast.parse(func_code)
     func_node = tree.body[0] if isinstance(tree, ast.Module) and tree.body else None
     if not func_node or not isinstance(func_node, ast.FunctionDef):
-        raise ValueError("Provided code does not contain a top-level function definition.")
+        raise ValueError(
+            "Provided code does not contain a top-level function definition."
+        )
 
     scopes: List[Dict[str, int]] = [{}]
     shadow_map: Dict[str, List[str]] = defaultdict(list)
     shadow_nodes: List[Tuple[int, str, str]] = []
 
     for node in ast.walk(tree):
-        lineno = getattr(node, 'lineno', 0)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
-                             ast.With, ast.AsyncWith, ast.ListComp, ast.DictComp,
-                             ast.SetComp, ast.GeneratorExp)):
+        lineno = getattr(node, "lineno", 0)
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.With,
+                ast.AsyncWith,
+                ast.ListComp,
+                ast.DictComp,
+                ast.SetComp,
+                ast.GeneratorExp,
+            ),
+        ):
             scopes.append({})
 
         assigned = _collect_assigned_names(node, scopes[-1])
@@ -67,12 +85,24 @@ def _detect_shadowing(func_code: str) -> Tuple[Dict[str, List[str]], List[Tuple[
             else:
                 scopes[-1][name] = 0
 
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
-                             ast.With, ast.AsyncWith, ast.ListComp, ast.DictComp,
-                             ast.SetComp, ast.GeneratorExp)):
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.With,
+                ast.AsyncWith,
+                ast.ListComp,
+                ast.DictComp,
+                ast.SetComp,
+                ast.GeneratorExp,
+            ),
+        ):
             scopes.pop()
 
     return dict(shadow_map), shadow_nodes
+
 
 def refactor_variable_shadowing(source: str) -> str:
     """Detect and rename variables that shadow outer‑scope names inside a function.
@@ -84,9 +114,14 @@ def refactor_variable_shadowing(source: str) -> str:
     func_ranges = []
     start = None
     for i, line in enumerate(lines):
-        if re.search(r'\bdef\s+\w+\s*\(', line):
+        if re.search(r"\bdef\s+\w+\s*\(", line):
             start = i
-        if start is not None and line.strip() and not line.startswith(' ') and not line.startswith('\t'):
+        if (
+            start is not None
+            and line.strip()
+            and not line.startswith(" ")
+            and not line.startswith("\t")
+        ):
             if start < i:
                 func_ranges.append((start, i))
             start = None
@@ -96,7 +131,7 @@ def refactor_variable_shadowing(source: str) -> str:
     new_lines = lines[:]
     offset = 0
     for func_start, func_end in func_ranges:
-        func_source = '\n'.join(new_lines[func_start:func_end])
+        func_source = "\n".join(new_lines[func_start:func_end])
         try:
             _, shadow_nodes = _detect_shadowing(func_source)
         except Exception:
@@ -105,6 +140,8 @@ def refactor_variable_shadowing(source: str) -> str:
         for lineno, old_name, new_name in sorted(shadow_nodes, key=lambda x: -x[0]):
             abs_lineno = lineno + offset
             if abs_lineno < len(new_lines):
-                new_lines[abs_lineno] = new_lines[abs_lineno].replace(old_name, new_name)
+                new_lines[abs_lineno] = new_lines[abs_lineno].replace(
+                    old_name, new_name
+                )
         offset += func_end - func_start
-    return '\n'.join(new_lines)
+    return "\n".join(new_lines)

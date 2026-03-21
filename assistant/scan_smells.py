@@ -1,5 +1,6 @@
-import re
 import os
+import re
+
 
 def scan_file_for_smells(filepath: str) -> list[str]:
     """Scan a Python file for common code smells using simple regex patterns.
@@ -36,7 +37,7 @@ def scan_file_for_smells(filepath: str) -> list[str]:
     if re.search(r"\bdict\s*=", content):
         smells.append("Shadowing built‑in 'dict'")
     if re.search(r"\bstr\s*=", content):
-        smells.append("Shadowing built‑in 'str'")  
+        smells.append("Shadowing built‑in 'str'")
 
     # 6. Using 'is' for None check (not a smell but sometimes flagged)
     if re.search(r"\bis\s+None\b", content):
@@ -63,5 +64,6 @@ def scan_project(root_path: str = "."):
 if __name__ == "__main__":
     # Quick demo when run directly
     import json
+
     report = scan_project()
     print(json.dumps(report, indent=2))

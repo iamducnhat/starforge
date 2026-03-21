@@ -29,7 +29,8 @@ from pathlib import Path
 from typing import Any, Literal, TextIO, overload
 
 from .json_parser import JSONParser
-from .schema_repair import SchemaRepairer, load_schema_model, normalize_schema_repair_mode, schema_from_input
+from .schema_repair import (SchemaRepairer, load_schema_model,
+                            normalize_schema_repair_mode, schema_from_input)
 from .utils.constants import JSONReturnType
 
 
@@ -107,7 +108,11 @@ def repair_json(
     parser = JSONParser(json_str, json_fd, logging, chunk_length, stream_stable, strict)
     schema_obj = schema_from_input(schema) if schema is not None else None
     repairer = (
-        SchemaRepairer(schema_obj, parser.logger if logging else None, schema_repair_mode=schema_repair_mode)
+        SchemaRepairer(
+            schema_obj,
+            parser.logger if logging else None,
+            schema_repair_mode=schema_repair_mode,
+        )
         if schema_obj is not None
         else None
     )
@@ -349,14 +354,22 @@ def cli(inline_args: list[str] | None = None) -> int:
         sys.exit(1)
 
     if args.schema and args.schema_model:
-        print("Error: You cannot pass both --schema and --schema-model", file=sys.stderr)
+        print(
+            "Error: You cannot pass both --schema and --schema-model", file=sys.stderr
+        )
         sys.exit(1)
 
     if args.strict and (args.schema or args.schema_model):
-        print("Error: --strict cannot be used with --schema or --schema-model", file=sys.stderr)
+        print(
+            "Error: --strict cannot be used with --schema or --schema-model",
+            file=sys.stderr,
+        )
         sys.exit(1)
     if args.schema_repair_mode == "salvage" and not (args.schema or args.schema_model):
-        print("Error: --schema-repair-mode salvage requires --schema or --schema-model", file=sys.stderr)
+        print(
+            "Error: --schema-repair-mode salvage requires --schema or --schema-model",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     ensure_ascii = args.ensure_ascii

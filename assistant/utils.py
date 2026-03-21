@@ -20,6 +20,7 @@ def utc_now_iso() -> str:
 def slugify(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9_\- ]+", "", name).strip().lower()
     s = re.sub(r"[\s\-]+", "_", s)
+    s = s.strip("_")
     return s or "item"
 
 
@@ -98,45 +99,45 @@ def _extract_balanced_json(text: str) -> list[str]:
 
 
 def _heal_json_string(s: str) -> str:
-    s = s.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-    
+    s = s.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
     out = []
     i = 0
     n = len(s)
     in_string = False
     escape = False
-    
+
     while i < n:
         c = s[i]
-        
+
         if not in_string:
             if c == '"':
                 in_string = True
             out.append(c)
         else:
             if escape:
-                out.append('\\')
+                out.append("\\")
                 out.append(c)
                 escape = False
-            elif c == '\\':
+            elif c == "\\":
                 escape = True
             elif c == '"':
                 j = i + 1
-                while j < n and s[j] in ' \n\r\t':
+                while j < n and s[j] in " \n\r\t":
                     j += 1
-                
+
                 is_end = False
                 if j == n:
                     is_end = True
-                elif s[j] in ',}]':
+                elif s[j] in ",}]":
                     is_end = True
-                elif s[j] == ':':
+                elif s[j] == ":":
                     k = j + 1
-                    while k < n and s[k] in ' \n\r\t':
+                    while k < n and s[k] in " \n\r\t":
                         k += 1
                     if k < n and s[k] in '"{[tfn0123456789-+':
                         is_end = True
-                
+
                 if is_end:
                     in_string = False
                     out.append(c)
@@ -145,19 +146,19 @@ def _heal_json_string(s: str) -> str:
             else:
                 out.append(c)
         i += 1
-    
+
     healed = "".join(out)
-    
+
     stack = []
     in_str = False
     esc = False
     final_out = []
-    
+
     for c in healed:
         if in_str:
             if esc:
                 esc = False
-            elif c == '\\':
+            elif c == "\\":
                 esc = True
             elif c == '"':
                 in_str = False
@@ -166,33 +167,33 @@ def _heal_json_string(s: str) -> str:
             if c == '"':
                 in_str = True
                 final_out.append(c)
-            elif c in '{[':
+            elif c in "{[":
                 stack.append(c)
                 final_out.append(c)
-            elif c == '}':
-                while stack and stack[-1] != '{':
+            elif c == "}":
+                while stack and stack[-1] != "{":
                     stack.pop()
-                    final_out.append(']')
-                if stack and stack[-1] == '{':
+                    final_out.append("]")
+                if stack and stack[-1] == "{":
                     stack.pop()
-                    final_out.append('}')
-            elif c == ']':
-                while stack and stack[-1] != '[':
+                    final_out.append("}")
+            elif c == "]":
+                while stack and stack[-1] != "[":
                     stack.pop()
-                    final_out.append('}')
-                if stack and stack[-1] == '[':
+                    final_out.append("}")
+                if stack and stack[-1] == "[":
                     stack.pop()
-                    final_out.append(']')
+                    final_out.append("]")
             else:
                 final_out.append(c)
-                
+
     if in_str:
         final_out.append('"')
-        
+
     while stack:
         last = stack.pop()
-        final_out.append('}' if last == '{' else ']')
-        
+        final_out.append("}" if last == "{" else "]")
+
     return "".join(final_out)
 
 
@@ -206,7 +207,7 @@ def parse_json_payload(text: str) -> Any | None:
         return json.loads(stripped)
     except json.JSONDecodeError:
         pass
-        
+
     try:
         healed = _heal_json_string(stripped)
         return json.loads(healed)
@@ -292,6 +293,12 @@ def redact_secrets_text(text: str) -> str:
     out = re.sub(
         r"(?im)^(\s*[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|ACCESS_KEY)[A-Z0-9_]*\s*=\s*)(.+)\s*$",
         r"\1***REDACTED***",
+        out,
+    )
+    # Inline key=value style
+    out = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password|passwd|access[_-]?key)\s*=\s*([^\s,;]+)",
+        lambda m: f"{m.group(1)}=***REDACTED***",
         out,
     )
     # JSON-like "key": "value"

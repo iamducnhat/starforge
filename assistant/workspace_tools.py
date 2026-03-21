@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import threading
 import time
-import queue
-import json
 from pathlib import Path
 from typing import Any
 
-from .utils import ensure_dir, read_json, redact_secrets_text, slugify, utc_now_iso, write_json, write_text
 from .logging_config import get_logger
+from .utils import (ensure_dir, read_json, redact_secrets_text, slugify,
+                    utc_now_iso, write_json, write_text)
 
 logger = get_logger(__name__)
+
 
 class WorkspaceTools:
     def __init__(self, workspace_root: str | Path) -> None:
@@ -27,7 +29,11 @@ class WorkspaceTools:
         """Resolve a path relative to workspace root with security validation."""
         raw = Path(path)
         try:
-            resolved = raw.resolve() if raw.is_absolute() else (self.workspace_root / raw).resolve()
+            resolved = (
+                raw.resolve()
+                if raw.is_absolute()
+                else (self.workspace_root / raw).resolve()
+            )
         except Exception as e:
             raise ValueError(f"invalid path: {path}") from e
 
@@ -51,7 +57,7 @@ class WorkspaceTools:
         max_entries: int = 200,
     ) -> dict[str, Any]:
         """List files in a directory with comprehensive validation and error handling."""
-        
+
         # Validate input parameters
         if not isinstance(path, str):
             return {"ok": False, "error": "path must be a string"}
@@ -81,7 +87,9 @@ class WorkspaceTools:
                     break
 
                 rel = self._to_workspace_rel(p)
-                if not include_hidden and any(part.startswith(".") for part in Path(rel).parts):
+                if not include_hidden and any(
+                    part.startswith(".") for part in Path(rel).parts
+                ):
                     continue
                 if p.is_dir():
                     continue
@@ -93,10 +101,19 @@ class WorkspaceTools:
                 entries.append({"path": rel, "size": size})
 
             entries.sort(key=lambda x: x["path"])
-            return {"ok": True, "root": self._to_workspace_rel(base), "count": len(entries), "files": entries}
+            return {
+                "ok": True,
+                "root": self._to_workspace_rel(base),
+                "count": len(entries),
+                "files": entries,
+            }
         except Exception as e:
             logger.error(f"Failed to list files in {path}: {e}")
-            return {"ok": False, "error": f"error listing files: {str(e)}", "hint": "Check permissions and path validity"}
+            return {
+                "ok": False,
+                "error": f"error listing files: {str(e)}",
+                "hint": "Check permissions and path validity",
+            }
 
     def read_file(
         self,
@@ -113,15 +130,41 @@ class WorkspaceTools:
             logger.warning(f"Read failed: not a file: {path}")
             return {"ok": False, "error": f"not a file: {path}"}
 
-        text = file_path.read_text(encoding="utf-8", errors="replace")
-        lines = text.splitlines()
-
         s = max(1, start_line)
-        e = len(lines) if end_line is None else max(s, min(end_line, len(lines)))
-        selected = "\n".join(lines[s - 1 : e])
+        requested_end = None if end_line is None else max(s, int(end_line))
+        max_len = max(1, int(max_chars))
+
+        selected_parts: list[str] = []
+        selected_chars = 0
         truncated = False
-        if len(selected) > max_chars:
-            selected = selected[: max_chars - 3] + "..."
+        actual_end = s
+
+        with file_path.open("r", encoding="utf-8", errors="replace") as f:
+            for idx, raw_line in enumerate(f, start=1):
+                if idx < s:
+                    continue
+                if requested_end is not None and idx > requested_end:
+                    break
+
+                line = raw_line.rstrip("\n")
+                segment = line if not selected_parts else f"\n{line}"
+                seg_len = len(segment)
+                if selected_chars + seg_len > max_len:
+                    remaining = max_len - selected_chars
+                    if remaining > 0:
+                        selected_parts.append(segment[:remaining])
+                    truncated = True
+                    break
+                selected_parts.append(segment)
+                selected_chars += seg_len
+                actual_end = idx
+
+        selected = "".join(selected_parts)
+        if len(selected) > max_len:
+            clip = max(1, max_len - 3)
+            selected = selected[:clip] + "..."
+            truncated = True
+        elif requested_end is None and selected_chars >= max_len:
             truncated = True
 
         masked = redact_secrets_text(selected)
@@ -130,12 +173,14 @@ class WorkspaceTools:
             "ok": True,
             "path": self._to_workspace_rel(file_path),
             "start_line": s,
-            "end_line": e,
+            "end_line": max(s, actual_end),
             "truncated": truncated,
             "content": masked,
         }
 
-    def create_file(self, path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
+    def create_file(
+        self, path: str, content: str, overwrite: bool = False
+    ) -> dict[str, Any]:
         file_path = self._resolve(path)
         ensure_dir(file_path.parent)
 
@@ -148,13 +193,17 @@ class WorkspaceTools:
             }
         write_text(file_path, content)
 
-        return {"ok": True, "path": self._to_workspace_rel(file_path), "bytes": len(content.encode("utf-8"))}
+        return {
+            "ok": True,
+            "path": self._to_workspace_rel(file_path),
+            "bytes": len(content.encode("utf-8")),
+        }
 
     def create_folder(self, path: str) -> dict[str, Any]:
         folder_path = self._resolve(path)
         if folder_path.exists():
             return {"ok": False, "error": f"path already exists: {path}"}
-        
+
         try:
             ensure_dir(folder_path)
             return {"ok": True, "path": self._to_workspace_rel(folder_path)}
@@ -165,25 +214,34 @@ class WorkspaceTools:
         target_path = self._resolve(path)
         if not target_path.exists():
             return {"ok": False, "error": f"path not found: {path}"}
-        
+
         try:
             if target_path.is_dir():
                 shutil.rmtree(target_path)
             else:
                 target_path.unlink()
-            return {"ok": True, "path": self._to_workspace_rel(target_path), "deleted": True}
+            return {
+                "ok": True,
+                "path": self._to_workspace_rel(target_path),
+                "deleted": True,
+            }
         except Exception as e:
             return {"ok": False, "error": f"failed to delete: {e}"}
 
-    def run_terminal(self, action: str, cmd: str | None = None, session_id: str = "default") -> dict[str, Any]:
+    def run_terminal(
+        self, action: str, cmd: str | None = None, session_id: str = "default"
+    ) -> dict[str, Any]:
         actions = {"start", "send", "read", "close"}
         if action not in actions:
-            return {"ok": False, "error": f"invalid action '{action}', must be one of {actions}"}
+            return {
+                "ok": False,
+                "error": f"invalid action '{action}', must be one of {actions}",
+            }
 
         if action == "start":
             if session_id in self._terminals:
                 return {"ok": False, "error": f"Session {session_id} already exists."}
-            
+
             try:
                 proc = subprocess.Popen(
                     ["/bin/bash"],
@@ -192,7 +250,7 @@ class WorkspaceTools:
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
-                    cwd=str(self.workspace_root)
+                    cwd=str(self.workspace_root),
                 )
             except Exception as e:
                 return {"ok": False, "error": f"failed to start session: {e}"}
@@ -207,11 +265,21 @@ class WorkspaceTools:
                     pass
                 finally:
                     pipe.close()
-            
-            t = threading.Thread(target=reader, args=(proc.stdout, out_queue), daemon=True)
+
+            t = threading.Thread(
+                target=reader, args=(proc.stdout, out_queue), daemon=True
+            )
             t.start()
-            self._terminals[session_id] = {"proc": proc, "queue": out_queue, "thread": t}
-            return {"ok": True, "session_id": session_id, "message": f"Started session: {session_id}"}
+            self._terminals[session_id] = {
+                "proc": proc,
+                "queue": out_queue,
+                "thread": t,
+            }
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "message": f"Started session: {session_id}",
+            }
 
         s = self._terminals.get(session_id)
         if not s:
@@ -226,7 +294,11 @@ class WorkspaceTools:
                     cmd += "\n"
                 s["proc"].stdin.write(cmd)
                 s["proc"].stdin.flush()
-                return {"ok": True, "session_id": session_id, "message": f"Sent command."}
+                return {
+                    "ok": True,
+                    "session_id": session_id,
+                    "message": f"Sent command.",
+                }
             except Exception as e:
                 return {"ok": False, "error": f"failed to send command: {e}"}
 
@@ -236,17 +308,27 @@ class WorkspaceTools:
             while not s["queue"].empty():
                 lines.append(s["queue"].get_nowait())
             output = "".join(lines)
-            return {"ok": True, "session_id": session_id, "output": output if output else "[No new output]"}
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "output": output if output else "[No new output]",
+            }
 
         if action == "close":
             try:
                 s["proc"].terminate()
                 del self._terminals[session_id]
-                return {"ok": True, "session_id": session_id, "message": f"Closed session: {session_id}"}
+                return {
+                    "ok": True,
+                    "session_id": session_id,
+                    "message": f"Closed session: {session_id}",
+                }
             except Exception as e:
                 return {"ok": False, "error": f"failed to close session: {e}"}
 
-    def write_file(self, path: str, content: str, append: bool = False) -> dict[str, Any]:
+    def write_file(
+        self, path: str, content: str, append: bool = False
+    ) -> dict[str, Any]:
         # Backward-compatible shim. Prefer create_file + edit_file in tool protocol.
         file_path = self._resolve(path)
         ensure_dir(file_path.parent)
@@ -295,7 +377,11 @@ class WorkspaceTools:
             replacements = 1
 
         write_text(file_path, updated)
-        return {"ok": True, "path": self._to_workspace_rel(file_path), "replacements": replacements}
+        return {
+            "ok": True,
+            "path": self._to_workspace_rel(file_path),
+            "replacements": replacements,
+        }
 
     def search_project(
         self,
@@ -319,7 +405,15 @@ class WorkspaceTools:
         rel_base = self._to_workspace_rel(base)
 
         if shutil.which("rg"):
-            cmd = ["rg", "--json", "--line-number", "--color", "never", "--max-count", str(limit)]
+            cmd = [
+                "rg",
+                "--json",
+                "--line-number",
+                "--color",
+                "never",
+                "--max-count",
+                str(limit),
+            ]
             if not case_sensitive:
                 cmd.append("-i")
             if not regex:
@@ -381,10 +475,16 @@ class WorkspaceTools:
             if "\x00" in raw:
                 continue
             for i, line in enumerate(raw.splitlines(), start=1):
-                hit = bool(pattern.search(line)) if pattern else (q in line if case_sensitive else q.lower() in line.lower())
+                hit = (
+                    bool(pattern.search(line))
+                    if pattern
+                    else (q in line if case_sensitive else q.lower() in line.lower())
+                )
                 if not hit:
                     continue
-                matches.append({"path": self._to_workspace_rel(p), "line": i, "text": line[:400]})
+                matches.append(
+                    {"path": self._to_workspace_rel(p), "line": i, "text": line[:400]}
+                )
                 if len(matches) >= limit:
                     break
 
@@ -395,6 +495,576 @@ class WorkspaceTools:
             "path": rel_base,
             "count": len(matches),
             "matches": matches,
+        }
+
+    @staticmethod
+    def _code_language(path: Path) -> str:
+        ext = path.suffix.lower()
+        mapping = {
+            ".py": "python",
+            ".js": "javascript",
+            ".jsx": "javascript",
+            ".ts": "typescript",
+            ".tsx": "typescript",
+            ".go": "go",
+            ".rs": "rust",
+            ".java": "java",
+            ".c": "c",
+            ".h": "c",
+            ".cpp": "cpp",
+            ".hpp": "cpp",
+            ".cc": "cpp",
+            ".cxx": "cpp",
+            ".cs": "csharp",
+        }
+        return mapping.get(ext, "text")
+
+    def _extract_symbols(
+        self, path: Path, text: str, max_symbols_per_file: int = 200
+    ) -> list[dict[str, Any]]:
+        language = self._code_language(path)
+        patterns: list[tuple[str, str]]
+        if language == "python":
+            patterns = [
+                ("class", r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+                ("function", r"^\s*(?:async\s+def|def)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+            ]
+        elif language in {"javascript", "typescript"}:
+            patterns = [
+                ("class", r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+                ("function", r"^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+                (
+                    "function",
+                    r"^\s*(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(",
+                ),
+            ]
+        elif language == "go":
+            patterns = [
+                ("function", r"^\s*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+                (
+                    "method",
+                    r"^\s*func\s*\([^)]*\)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                ),
+                ("type", r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+struct\b"),
+            ]
+        elif language == "rust":
+            patterns = [
+                ("struct", r"^\s*(?:pub\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+                ("enum", r"^\s*(?:pub\s+)?enum\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+                ("trait", r"^\s*(?:pub\s+)?trait\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+                ("function", r"^\s*(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+            ]
+        elif language in {"java", "csharp"}:
+            patterns = [
+                (
+                    "class",
+                    r"^\s*(?:public|private|protected)?\s*(?:final\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+                ),
+                (
+                    "interface",
+                    r"^\s*(?:public|private|protected)?\s*interface\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+                ),
+                (
+                    "method",
+                    r"^\s*(?:public|private|protected)?\s*(?:static\s+)?[A-Za-z0-9_<>\[\]]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                ),
+            ]
+        else:
+            patterns = [
+                (
+                    "symbol",
+                    r"^\s*(?:def|function|class|struct|enum|trait|fn)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+                )
+            ]
+
+        symbols: list[dict[str, Any]] = []
+        for i, line in enumerate(text.splitlines(), start=1):
+            if len(symbols) >= max_symbols_per_file:
+                break
+            for sym_type, pat in patterns:
+                m = re.search(pat, line)
+                if not m:
+                    continue
+                symbols.append(
+                    {
+                        "name": m.group(1),
+                        "type": sym_type,
+                        "line": i,
+                        "language": language,
+                    }
+                )
+                break
+        return symbols
+
+    def index_symbols(
+        self,
+        path: str = ".",
+        glob: str = "**/*",
+        max_files: int = 300,
+        max_symbols: int = 5000,
+    ) -> dict[str, Any]:
+        base = self._resolve(path)
+        if not base.exists():
+            return {"ok": False, "error": f"path not found: {path}"}
+        if not base.is_dir():
+            return {"ok": False, "error": f"not a directory: {path}"}
+
+        code_ext = {
+            ".py",
+            ".js",
+            ".jsx",
+            ".ts",
+            ".tsx",
+            ".go",
+            ".rs",
+            ".java",
+            ".c",
+            ".h",
+            ".cpp",
+            ".hpp",
+            ".cc",
+            ".cxx",
+            ".cs",
+        }
+        file_limit = max(1, min(int(max_files), 5000))
+        symbol_limit = max(1, min(int(max_symbols), 20000))
+        pattern = glob.strip() or "**/*"
+
+        indexed_files = 0
+        symbols: list[dict[str, Any]] = []
+        for p in base.glob(pattern):
+            if indexed_files >= file_limit or len(symbols) >= symbol_limit:
+                break
+            if not p.is_file() or p.suffix.lower() not in code_ext:
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if "\x00" in text:
+                continue
+            indexed_files += 1
+            for sym in self._extract_symbols(p, text):
+                if len(symbols) >= symbol_limit:
+                    break
+                item = dict(sym)
+                item["path"] = self._to_workspace_rel(p)
+                symbols.append(item)
+
+        return {
+            "ok": True,
+            "path": self._to_workspace_rel(base),
+            "indexed_files": indexed_files,
+            "count": len(symbols),
+            "symbols": symbols,
+        }
+
+    def lookup_symbol(
+        self,
+        symbol: str,
+        path: str = ".",
+        glob: str = "**/*",
+        exact: bool = False,
+        max_results: int = 30,
+    ) -> dict[str, Any]:
+        query = (symbol or "").strip()
+        if not query:
+            return {"ok": False, "error": "symbol must not be empty"}
+
+        index = self.index_symbols(path=path, glob=glob, max_files=400, max_symbols=8000)
+        if not index.get("ok", False):
+            return index
+        symbols = index.get("symbols", [])
+        if not isinstance(symbols, list):
+            symbols = []
+
+        q = query.lower()
+        exact_match = bool(exact)
+        results: list[dict[str, Any]] = []
+        limit = max(1, min(int(max_results), 500))
+        for item in symbols:
+            if len(results) >= limit:
+                break
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", ""))
+            if not name:
+                continue
+            hit = name.lower() == q if exact_match else q in name.lower()
+            if not hit:
+                continue
+            results.append(item)
+
+        return {
+            "ok": True,
+            "symbol": query,
+            "exact": exact_match,
+            "count": len(results),
+            "matches": results,
+        }
+
+    def summarize_file(self, path: str, max_symbols: int = 20) -> dict[str, Any]:
+        file_path = self._resolve(path)
+        if not file_path.exists():
+            return {"ok": False, "error": f"file not found: {path}"}
+        if not file_path.is_file():
+            return {"ok": False, "error": f"not a file: {path}"}
+
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return {"ok": False, "error": f"failed to read file: {e}"}
+
+        lines = text.splitlines()
+        language = self._code_language(file_path)
+        symbols = self._extract_symbols(file_path, text, max_symbols_per_file=max_symbols)
+
+        imports: list[str] = []
+        for line in lines[:400]:
+            s = line.strip()
+            if (
+                s.startswith("import ")
+                or s.startswith("from ")
+                or s.startswith("#include ")
+                or s.startswith("use ")
+            ):
+                imports.append(s)
+            if len(imports) >= 20:
+                break
+
+        symbol_names = [f"{x.get('type')}:{x.get('name')}" for x in symbols[:max_symbols]]
+        summary_parts = [
+            f"path={self._to_workspace_rel(file_path)}",
+            f"language={language}",
+            f"lines={len(lines)}",
+            f"imports={len(imports)}",
+            f"symbols={len(symbols)}",
+        ]
+        if symbol_names:
+            summary_parts.append(f"top_symbols={', '.join(symbol_names[:10])}")
+        summary = " | ".join(summary_parts)
+
+        return {
+            "ok": True,
+            "path": self._to_workspace_rel(file_path),
+            "language": language,
+            "line_count": len(lines),
+            "imports": imports,
+            "symbols": symbols,
+            "summary": summary,
+        }
+
+    def detect_project_context(
+        self, path: str = ".", include_runtime: bool = True
+    ) -> dict[str, Any]:
+        base = self._resolve(path)
+        if not base.exists() or not base.is_dir():
+            return {"ok": False, "error": f"not a directory: {path}"}
+
+        top_files = {p.name for p in base.iterdir() if p.is_file()}
+        all_files: list[Path] = []
+        for p in base.glob("**/*"):
+            if p.is_file():
+                all_files.append(p)
+            if len(all_files) >= 6000:
+                break
+
+        lang_counts: dict[str, int] = {}
+        for p in all_files:
+            ext = p.suffix.lower() or "<none>"
+            lang_counts[ext] = lang_counts.get(ext, 0) + 1
+
+        framework = "unknown"
+        test_runner = "unknown"
+        entry_points: list[str] = []
+
+        req_text = ""
+        req_path = base / "requirements.txt"
+        if req_path.exists():
+            try:
+                req_text = req_path.read_text(encoding="utf-8", errors="replace").lower()
+            except Exception:
+                req_text = ""
+
+        pyproject_text = ""
+        pyproject = base / "pyproject.toml"
+        if pyproject.exists():
+            try:
+                pyproject_text = pyproject.read_text(
+                    encoding="utf-8", errors="replace"
+                ).lower()
+            except Exception:
+                pyproject_text = ""
+
+        package_json_text = ""
+        package_json = base / "package.json"
+        if package_json.exists():
+            try:
+                package_json_text = package_json.read_text(
+                    encoding="utf-8", errors="replace"
+                ).lower()
+            except Exception:
+                package_json_text = ""
+
+        if "fastapi" in req_text or "fastapi" in pyproject_text:
+            framework = "FastAPI"
+            test_runner = "pytest"
+        elif "flask" in req_text or "flask" in pyproject_text:
+            framework = "Flask"
+            test_runner = "pytest"
+        elif "django" in req_text or "django" in pyproject_text:
+            framework = "Django"
+            test_runner = "pytest"
+        elif package_json.exists():
+            framework = "Node.js"
+            test_runner = "npm test"
+            if "next" in package_json_text:
+                framework = "Next.js"
+            elif "react" in package_json_text:
+                framework = "React"
+            elif "express" in package_json_text:
+                framework = "Express"
+        elif (base / "go.mod").exists():
+            framework = "Go"
+            test_runner = "go test ./..."
+        elif (base / "Cargo.toml").exists():
+            framework = "Rust"
+            test_runner = "cargo test"
+        elif any(p.suffix.lower() == ".py" for p in all_files):
+            framework = "Python"
+            test_runner = "pytest"
+
+        candidates = [
+            "main.py",
+            "app.py",
+            "server.py",
+            "manage.py",
+            "src/main.py",
+            "src/app.py",
+            "index.js",
+            "server.js",
+            "main.go",
+        ]
+        for rel in candidates:
+            p = base / rel
+            if p.exists() and p.is_file():
+                entry_points.append(self._to_workspace_rel(p))
+
+        if not entry_points:
+            for p in all_files[:250]:
+                name = p.name.lower()
+                if name in {"main.py", "app.py", "server.py", "index.js", "main.go"}:
+                    entry_points.append(self._to_workspace_rel(p))
+                    if len(entry_points) >= 8:
+                        break
+
+        runtime: dict[str, Any] = {}
+        if include_runtime:
+            try:
+                git_proc = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(base),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                runtime["git_dirty_files"] = len(
+                    [ln for ln in git_proc.stdout.splitlines() if ln.strip()]
+                )
+            except Exception:
+                runtime["git_dirty_files"] = None
+            try:
+                py_proc = subprocess.run(
+                    ["python3", "--version"],
+                    cwd=str(base),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                runtime["python_version"] = (
+                    py_proc.stdout.strip() or py_proc.stderr.strip()
+                )
+            except Exception:
+                runtime["python_version"] = ""
+
+        return {
+            "ok": True,
+            "path": self._to_workspace_rel(base),
+            "framework": framework,
+            "test_runner": test_runner,
+            "entry_points": entry_points,
+            "top_files": sorted(top_files)[:60],
+            "language_extensions": dict(
+                sorted(lang_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+            ),
+            "runtime": runtime,
+        }
+
+    def execute_command(
+        self,
+        cmd: str,
+        path: str = ".",
+        timeout: int = 120,
+        max_output_chars: int = 12000,
+    ) -> dict[str, Any]:
+        base = self._resolve(path)
+        if not base.exists() or not base.is_dir():
+            return {"ok": False, "error": f"not a directory: {path}"}
+        if not isinstance(cmd, str) or not cmd.strip():
+            return {"ok": False, "error": "cmd must not be empty"}
+
+        started = time.time()
+        try:
+            proc = subprocess.run(
+                ["/bin/bash", "-lc", cmd],
+                cwd=str(base),
+                capture_output=True,
+                text=True,
+                timeout=max(1, int(timeout)),
+                check=False,
+            )
+            duration_ms = int((time.time() - started) * 1000)
+            out = (proc.stdout or "")[:max_output_chars]
+            err = (proc.stderr or "")[:max_output_chars]
+            return {
+                "ok": proc.returncode == 0,
+                "cmd": cmd,
+                "path": self._to_workspace_rel(base),
+                "exit_code": int(proc.returncode),
+                "duration_ms": duration_ms,
+                "stdout": out,
+                "stderr": err,
+                "truncated": (
+                    len(proc.stdout or "") > max_output_chars
+                    or len(proc.stderr or "") > max_output_chars
+                ),
+            }
+        except subprocess.TimeoutExpired as e:
+            duration_ms = int((time.time() - started) * 1000)
+            stdout = (e.stdout or "")[:max_output_chars] if isinstance(e.stdout, str) else ""
+            stderr = (e.stderr or "")[:max_output_chars] if isinstance(e.stderr, str) else ""
+            return {
+                "ok": False,
+                "cmd": cmd,
+                "path": self._to_workspace_rel(base),
+                "exit_code": None,
+                "duration_ms": duration_ms,
+                "timeout": True,
+                "stdout": stdout,
+                "stderr": stderr,
+                "error": f"command timed out after {timeout}s",
+            }
+        except Exception as e:
+            return {"ok": False, "error": f"failed to execute command: {e}", "cmd": cmd}
+
+    def run_tests(
+        self,
+        path: str = ".",
+        runner: str = "auto",
+        args: str = "",
+        timeout: int = 300,
+    ) -> dict[str, Any]:
+        base = self._resolve(path)
+        if not base.exists() or not base.is_dir():
+            return {"ok": False, "error": f"not a directory: {path}"}
+
+        selected = (runner or "auto").strip().lower()
+        if selected == "auto":
+            ctx = self.detect_project_context(path=path, include_runtime=False)
+            selected = str(ctx.get("test_runner", "pytest")).strip().lower()
+            if not selected or selected == "unknown":
+                selected = "pytest"
+
+        if selected in {"pytest", "py"}:
+            cmd = f"pytest -q {args}".strip()
+        elif selected in {"npm", "npm test", "node"}:
+            cmd = f"npm test -- {args}".strip()
+        elif selected in {"go", "go test"}:
+            cmd = f"go test ./... {args}".strip()
+        elif selected in {"cargo", "cargo test", "rust"}:
+            cmd = f"cargo test {args}".strip()
+        else:
+            cmd = f"{selected} {args}".strip()
+
+        result = self.execute_command(
+            cmd=cmd, path=path, timeout=timeout, max_output_chars=18000
+        )
+        stdout = str(result.get("stdout", ""))
+        stderr = str(result.get("stderr", ""))
+        text = f"{stdout}\n{stderr}"
+
+        failed = 0
+        passed = 0
+        m_failed = re.search(r"(\d+)\s+failed", text, flags=re.IGNORECASE)
+        if m_failed:
+            failed = int(m_failed.group(1))
+        m_passed = re.search(r"(\d+)\s+passed", text, flags=re.IGNORECASE)
+        if m_passed:
+            passed = int(m_passed.group(1))
+
+        return {
+            "ok": bool(result.get("ok", False)),
+            "runner": selected,
+            "command": cmd,
+            "path": self._to_workspace_rel(base),
+            "exit_code": result.get("exit_code"),
+            "duration_ms": result.get("duration_ms"),
+            "passed": passed,
+            "failed": failed,
+            "stdout": stdout,
+            "stderr": stderr,
+            "raw": result,
+        }
+
+    def get_git_diff(
+        self, path: str = ".", staged: bool = False, max_chars: int = 12000
+    ) -> dict[str, Any]:
+        base = self._resolve(path)
+        if not base.exists() or not base.is_dir():
+            return {"ok": False, "error": f"not a directory: {path}"}
+        cmd = "git diff --staged" if staged else "git diff"
+        result = self.execute_command(
+            cmd=cmd, path=path, timeout=30, max_output_chars=max_chars
+        )
+        return {
+            "ok": bool(result.get("ok", False) or result.get("exit_code", 1) == 0),
+            "path": self._to_workspace_rel(base),
+            "staged": bool(staged),
+            "diff": str(result.get("stdout", "")),
+            "error": result.get("error", ""),
+            "exit_code": result.get("exit_code"),
+        }
+
+    def validate_workspace_changes(
+        self,
+        path: str = ".",
+        test_runner: str = "auto",
+        test_args: str = "",
+        timeout: int = 300,
+    ) -> dict[str, Any]:
+        diff_data = self.get_git_diff(path=path, staged=False, max_chars=12000)
+        test_data = self.run_tests(
+            path=path,
+            runner=test_runner,
+            args=test_args,
+            timeout=timeout,
+        )
+        diff_text = str(diff_data.get("diff", ""))
+        changed_files = set()
+        for line in diff_text.splitlines():
+            if line.startswith("+++ b/") or line.startswith("--- a/"):
+                fp = line[6:].strip()
+                if fp and fp != "/dev/null":
+                    changed_files.add(fp)
+        return {
+            "ok": bool(test_data.get("ok", False)),
+            "path": path,
+            "changed_file_count": len(changed_files),
+            "changed_files": sorted(changed_files)[:200],
+            "tests": test_data,
+            "diff_excerpt": diff_text[:4000],
         }
 
     def _plan_path(self, plan_id: str) -> Path:
@@ -489,9 +1159,17 @@ class WorkspaceTools:
         todos = plan.get("todos", [])
         if not isinstance(todos, list):
             todos = []
-        next_id = max([int(t.get("id", 0)) for t in todos if isinstance(t, dict)] + [0]) + 1
+        next_id = (
+            max([int(t.get("id", 0)) for t in todos if isinstance(t, dict)] + [0]) + 1
+        )
         now = utc_now_iso()
-        todo = {"id": next_id, "text": text.strip(), "status": "pending", "created_at": now, "updated_at": now}
+        todo = {
+            "id": next_id,
+            "text": text.strip(),
+            "status": "pending",
+            "created_at": now,
+            "updated_at": now,
+        }
         todos.append(todo)
         plan["todos"] = todos
         plan["updated_at"] = now

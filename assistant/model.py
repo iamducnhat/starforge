@@ -15,15 +15,15 @@ from .utils import get_env_bool as _env_bool
 from .utils import get_env_float as _env_float
 from .utils import get_env_int as _env_int
 
-
 # Fix for macOS DNS resolution issue - use nslookup as fallback
 _dns_cache: dict[str, str] = {}
+
 
 def _resolve_hostname(hostname: str) -> str:
     """Resolve hostname with fallback to nslookup."""
     if hostname in _dns_cache:
         return _dns_cache[hostname]
-    
+
     # Try standard resolution first
     try:
         ip = socket.gethostbyname(hostname)
@@ -31,31 +31,31 @@ def _resolve_hostname(hostname: str) -> str:
         return ip
     except socket.gaierror:
         pass
-    
+
     # Fallback to nslookup
     try:
         result = subprocess.run(
-            ["nslookup", hostname],
-            capture_output=True,
-            text=True,
-            timeout=5
+            ["nslookup", hostname], capture_output=True, text=True, timeout=5
         )
-        for line in result.stdout.split('\n'):
-            if 'Address:' in line and not line.startswith('Server:'):
+        for line in result.stdout.split("\n"):
+            if "Address:" in line and not line.startswith("Server:"):
                 parts = line.split()
                 if parts:
                     ip = parts[-1]
-                    if '.' in ip and all(p.isdigit() for p in ip.split('.')):
+                    if "." in ip and all(p.isdigit() for p in ip.split(".")):
                         _dns_cache[hostname] = ip
                         return ip
     except Exception:
         pass
-    
+
     # If all fails, return original hostname
     return hostname
 
+
 # Patch socket.getaddrinfo to use our DNS resolver
 _original_getaddrinfo = socket.getaddrinfo
+
+
 def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     """Patch getaddrinfo to handle DNS resolution failures."""
     try:
@@ -64,8 +64,11 @@ def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         # Try resolving with our fallback
         resolved_host = _resolve_hostname(host)
         if resolved_host != host:
-            return _original_getaddrinfo(resolved_host, port, family, type, proto, flags)
+            return _original_getaddrinfo(
+                resolved_host, port, family, type, proto, flags
+            )
         raise
+
 
 socket.getaddrinfo = _patched_getaddrinfo
 
@@ -92,7 +95,12 @@ def _detect_total_ram_gb() -> float:
     try:
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
-        if isinstance(pages, int) and isinstance(page_size, int) and pages > 0 and page_size > 0:
+        if (
+            isinstance(pages, int)
+            and isinstance(page_size, int)
+            and pages > 0
+            and page_size > 0
+        ):
             return (pages * page_size) / (1024**3)
     except Exception:
         pass
@@ -164,14 +172,21 @@ def _pick_openrouter_model(
     if requested_clean in available:
         return requested_clean, "requested model is available"
 
-    candidates = [env_fallback.strip(), "arcee-ai/trinity-large-preview:free", "openrouter/auto"]
+    candidates = [
+        env_fallback.strip(),
+        "arcee-ai/trinity-large-preview:free",
+        "openrouter/auto",
+    ]
     for cand in candidates:
         if cand and cand in available:
             return cand, f"requested model not found, fallback to {cand}"
 
     free_models = [m for m in available if m.endswith(":free")]
     if free_models:
-        return free_models[0], f"requested model not found, fallback to {free_models[0]}"
+        return (
+            free_models[0],
+            f"requested model not found, fallback to {free_models[0]}",
+        )
 
     return available[0], f"requested model not found, fallback to {available[0]}"
 
@@ -273,7 +288,12 @@ class BaseModel:
 
 
 class OllamaModel(BaseModel):
-    def __init__(self, model_name: str, base_url: str = "http://127.0.0.1:11434", timeout: int = 60) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        base_url: str = "http://127.0.0.1:11434",
+        timeout: int = 60,
+    ) -> None:
         self.model_name = model_name
         self.base_url = base_url.rstrip("/")
         self.endpoint = self.base_url
@@ -291,7 +311,9 @@ class OllamaModel(BaseModel):
         self.total_ram_gb = round(_detect_total_ram_gb(), 2)
         self.model_params_b = _estimate_model_params_b(model_name)
         self.auto_limits = bool(auto_limits)
-        recommended_ctx, recommended_pred, _ram, _params = _auto_local_limits(model_name)
+        recommended_ctx, recommended_pred, _ram, _params = _auto_local_limits(
+            model_name
+        )
         self.auto_limits_snapshot = {
             "recommended_ctx": recommended_ctx,
             "recommended_maxout": recommended_pred,
@@ -323,7 +345,10 @@ class OllamaModel(BaseModel):
         capped = min(value, max(1024, ctx // 2))
         self.options["num_predict"] = capped
         if capped != value:
-            return True, f"ollama num_predict set to {capped} (capped by context window)"
+            return (
+                True,
+                f"ollama num_predict set to {capped} (capped by context window)",
+            )
         return True, f"ollama num_predict set to {capped}"
 
     def get_max_output_tokens(self) -> int | None:
@@ -368,7 +393,10 @@ class OllamaModel(BaseModel):
             "model_params_b": params_b,
             "auto_enabled": bool(self.auto_limits),
         }
-        return True, f"applied auto limits: ctx={ctx}, maxout={pred} (ram≈{round(ram_gb, 2)}GB, params≈{params_b}B)"
+        return (
+            True,
+            f"applied auto limits: ctx={ctx}, maxout={pred} (ram≈{round(ram_gb, 2)}GB, params≈{params_b}B)",
+        )
 
     def get_auto_limits(self) -> dict[str, Any] | None:
         snapshot = getattr(self, "auto_limits_snapshot", None)
@@ -384,11 +412,15 @@ class OllamaModel(BaseModel):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urlopen(req, timeout=self.timeout) as resp:  # nosec B310 - localhost endpoint
+        with urlopen(
+            req, timeout=self.timeout
+        ) as resp:  # nosec B310 - localhost endpoint
             raw = resp.read().decode("utf-8")
         return json.loads(raw)
 
-    def _stream_post_json(self, path: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    def _stream_post_json(
+        self, path: str, payload: dict[str, Any]
+    ) -> Iterator[dict[str, Any]]:
         body = json.dumps(payload).encode("utf-8")
         req = Request(
             f"{self.base_url}{path}",
@@ -396,7 +428,9 @@ class OllamaModel(BaseModel):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urlopen(req, timeout=self.timeout) as resp:  # nosec B310 - localhost endpoint
+        with urlopen(
+            req, timeout=self.timeout
+        ) as resp:  # nosec B310 - localhost endpoint
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="ignore").strip()
                 if not line:
@@ -579,8 +613,14 @@ class OpenRouterModel(BaseModel):
         self.stream_timeout = _env_int("ASSISTANT_STREAM_TIMEOUT", 35)
         self.temperature = _env_float("ASSISTANT_TEMPERATURE", 0.2)
         self.top_p = _env_float("ASSISTANT_TOP_P", 0.95)
-        self.context_window = int(context_window) if isinstance(context_window, int) and context_window > 0 else None
-        self.auto_limits = os.getenv("ASSISTANT_AUTO_LIMITS", "1").strip().lower() not in {"0", "false", "off"}
+        self.context_window = (
+            int(context_window)
+            if isinstance(context_window, int) and context_window > 0
+            else None
+        )
+        self.auto_limits = os.getenv(
+            "ASSISTANT_AUTO_LIMITS", "1"
+        ).strip().lower() not in {"0", "false", "off"}
         user_pred_raw = os.getenv("ASSISTANT_NUM_PREDICT", "").strip()
         if user_pred_raw:
             self.max_tokens = _env_int("ASSISTANT_NUM_PREDICT", 32768)
@@ -596,12 +636,24 @@ class OpenRouterModel(BaseModel):
             "context_window": self.context_window,
             "auto_enabled": bool(self.auto_limits),
         }
-        self.http_referer = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost").strip()
-        self.app_name = os.getenv("OPENROUTER_APP_NAME", "Local Coding Assistant").strip()
-        self.fallback_model = os.getenv("OPENROUTER_FALLBACK_MODEL", "arcee-ai/trinity-large-preview:free").strip()
+        self.http_referer = os.getenv(
+            "OPENROUTER_HTTP_REFERER", "http://localhost"
+        ).strip()
+        self.app_name = os.getenv(
+            "OPENROUTER_APP_NAME", "Local Coding Assistant"
+        ).strip()
+        self.fallback_model = os.getenv(
+            "OPENROUTER_FALLBACK_MODEL", "arcee-ai/trinity-large-preview:free"
+        ).strip()
         raw_provider = os.getenv("OPENROUTER_PROVIDER", "").strip()
-        self.provider_order: list[str] = [p.strip() for p in raw_provider.split(",") if p.strip()] if raw_provider else []
-        self.provider_only: bool = os.getenv("OPENROUTER_PROVIDER_ONLY", "0").strip().lower() not in {"0", "false", "off", ""}
+        self.provider_order: list[str] = (
+            [p.strip() for p in raw_provider.split(",") if p.strip()]
+            if raw_provider
+            else []
+        )
+        self.provider_only: bool = os.getenv(
+            "OPENROUTER_PROVIDER_ONLY", "0"
+        ).strip().lower() not in {"0", "false", "off", ""}
 
     def set_max_output_tokens(self, value: int) -> tuple[bool, str]:
         if value <= 0:
@@ -613,14 +665,21 @@ class OpenRouterModel(BaseModel):
             capped = value
         self.max_tokens = capped
         if capped != value:
-            return True, f"openrouter max_tokens set to {capped} (capped by context window)"
+            return (
+                True,
+                f"openrouter max_tokens set to {capped} (capped by context window)",
+            )
         return True, f"openrouter max_tokens set to {capped}"
 
     def get_max_output_tokens(self) -> int | None:
         return int(self.max_tokens) if isinstance(self.max_tokens, int) else None
 
     def get_context_window(self) -> int | None:
-        return int(self.context_window) if isinstance(self.context_window, int) and self.context_window > 0 else None
+        return (
+            int(self.context_window)
+            if isinstance(self.context_window, int) and self.context_window > 0
+            else None
+        )
 
     def set_stream_mode(self, mode: str) -> tuple[bool, str]:
         m = (mode or "").strip().lower()
@@ -647,7 +706,10 @@ class OpenRouterModel(BaseModel):
             "auto_enabled": bool(self.auto_limits),
         }
         if self.context_window:
-            return True, f"applied auto limits: maxout={recommended} (context={self.context_window})"
+            return (
+                True,
+                f"applied auto limits: maxout={recommended} (context={self.context_window})",
+            )
         return True, f"applied auto limits: maxout={recommended}"
 
     def get_auto_limits(self) -> dict[str, Any] | None:
@@ -701,11 +763,15 @@ class OpenRouterModel(BaseModel):
             headers=self._headers(),
             method="POST",
         )
-        with urlopen(req, timeout=self.timeout) as resp:  # nosec B310 - HTTPS OpenRouter endpoint
+        with urlopen(
+            req, timeout=self.timeout
+        ) as resp:  # nosec B310 - HTTPS OpenRouter endpoint
             raw = resp.read().decode("utf-8")
         return json.loads(raw)
 
-    def _stream_post_json(self, path: str, payload: dict[str, Any], timeout: int | None = None) -> Iterator[dict[str, Any]]:
+    def _stream_post_json(
+        self, path: str, payload: dict[str, Any], timeout: int | None = None
+    ) -> Iterator[dict[str, Any]]:
         body = json.dumps(payload).encode("utf-8")
         req = Request(
             f"{self.base_url}{path}",
@@ -713,8 +779,12 @@ class OpenRouterModel(BaseModel):
             headers=self._headers(),
             method="POST",
         )
-        effective_timeout = timeout if isinstance(timeout, int) and timeout > 0 else self.timeout
-        with urlopen(req, timeout=effective_timeout) as resp:  # nosec B310 - HTTPS OpenRouter endpoint
+        effective_timeout = (
+            timeout if isinstance(timeout, int) and timeout > 0 else self.timeout
+        )
+        with urlopen(
+            req, timeout=effective_timeout
+        ) as resp:  # nosec B310 - HTTPS OpenRouter endpoint
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="ignore").strip()
                 if not line:
@@ -733,7 +803,9 @@ class OpenRouterModel(BaseModel):
                 except json.JSONDecodeError:
                     continue
 
-    def _chat_payload(self, messages: list[dict[str, str]], stream: bool) -> dict[str, Any]:
+    def _chat_payload(
+        self, messages: list[dict[str, str]], stream: bool
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model_name,
             "messages": messages,
@@ -747,7 +819,10 @@ class OpenRouterModel(BaseModel):
             if self.provider_only:
                 payload["provider"] = {"only": self.provider_order}
             else:
-                payload["provider"] = {"order": self.provider_order, "allow_fallbacks": True}
+                payload["provider"] = {
+                    "order": self.provider_order,
+                    "allow_fallbacks": True,
+                }
         return payload
 
     @staticmethod
@@ -817,8 +892,12 @@ class OpenRouterModel(BaseModel):
             self.provider_order = []
             self.provider_only = False
             self.connect_log.append(f"[warn] model '{old}' requires payment (402)")
-            self.connect_log.append(f"[ok] switched to free fallback model '{fallback}' (provider routing cleared)")
-            print(f"[402] model '{old}' requires payment, switching to free fallback '{fallback}'")
+            self.connect_log.append(
+                f"[ok] switched to free fallback model '{fallback}' (provider routing cleared)"
+            )
+            print(
+                f"[402] model '{old}' requires payment, switching to free fallback '{fallback}'"
+            )
             return True
         return False
 
@@ -833,8 +912,10 @@ class OpenRouterModel(BaseModel):
                 return text or "OpenRouter returned an empty response."
             except HTTPError as e:
                 if e.code == 429:
-                    wait = min(60, 10 * (2 ** attempt))
-                    print(f"[rate limit] OpenRouter 429, waiting {wait}s (attempt {attempt + 1}/4)...")
+                    wait = min(60, 10 * (2**attempt))
+                    print(
+                        f"[rate limit] OpenRouter 429, waiting {wait}s (attempt {attempt + 1}/4)..."
+                    )
                     time.sleep(wait)
                     continue
                 if e.code == 402:
@@ -844,7 +925,10 @@ class OpenRouterModel(BaseModel):
                     return "OpenRouter request failed: HTTP Error 402: Payment Required. Add credits or use a free model."
                 if e.code == 404 and self._switch_model_if_missing():
                     try:
-                        retry = self._post_json("/chat/completions", self._chat_payload(messages, stream=False))
+                        retry = self._post_json(
+                            "/chat/completions",
+                            self._chat_payload(messages, stream=False),
+                        )
                         retry_text = self._extract_final_text(retry)
                         return retry_text or "OpenRouter returned an empty response."
                     except Exception as e2:
@@ -867,7 +951,9 @@ class OpenRouterModel(BaseModel):
         in_think = False
         emitted = False
         try:
-            for data in self._stream_post_json("/chat/completions", payload, timeout=self.stream_timeout):
+            for data in self._stream_post_json(
+                "/chat/completions", payload, timeout=self.stream_timeout
+            ):
                 thinking, content = self._extract_stream_delta(data)
                 if thinking:
                     if not in_think:
@@ -985,7 +1071,9 @@ class GoogleModel(BaseModel):
             raw = resp.read().decode("utf-8")
         return json.loads(raw)
 
-    def _stream_post_json(self, path: str, payload: dict[str, Any], timeout: int | None = None) -> Iterator[dict[str, Any]]:
+    def _stream_post_json(
+        self, path: str, payload: dict[str, Any], timeout: int | None = None
+    ) -> Iterator[dict[str, Any]]:
         body = json.dumps(payload).encode("utf-8")
         req = Request(
             f"{self.base_url}{path}",
@@ -993,7 +1081,9 @@ class GoogleModel(BaseModel):
             headers=self._headers(),
             method="POST",
         )
-        effective_timeout = timeout if isinstance(timeout, int) and timeout > 0 else self.timeout
+        effective_timeout = (
+            timeout if isinstance(timeout, int) and timeout > 0 else self.timeout
+        )
         with urlopen(req, timeout=effective_timeout) as resp:  # nosec B310
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="ignore").strip()
@@ -1029,7 +1119,9 @@ class GoogleModel(BaseModel):
 
         # Ensure the first message is a user message
         if alt_messages and alt_messages[0].get("role") == "model":
-            alt_messages.insert(0, {"role": "user", "parts": [{"text": "(conversation begin)"}]})
+            alt_messages.insert(
+                0, {"role": "user", "parts": [{"text": "(conversation begin)"}]}
+            )
 
         payload: dict[str, Any] = {
             "contents": alt_messages,
@@ -1045,7 +1137,7 @@ class GoogleModel(BaseModel):
         # support it, so this is safe.  Thinking output surfaces as <think>…</think>
         # in the stream and is rendered in the CLI by StreamRenderer.
         payload["generationConfig"]["thinkingConfig"] = {
-            "thinkingBudget": -1,       # let the model decide how much to think
+            "thinkingBudget": -1,  # let the model decide how much to think
             "includeThoughts": True,
         }
 
@@ -1166,7 +1258,9 @@ class GoogleModel(BaseModel):
         emitted = False
         in_think = False
         try:
-            for data in self._stream_post_json(path, payload, timeout=self.stream_timeout):
+            for data in self._stream_post_json(
+                path, payload, timeout=self.stream_timeout
+            ):
                 thinking, content = self._extract_stream_delta(data)
                 if thinking:
                     if not in_think:
@@ -1188,7 +1282,9 @@ class GoogleModel(BaseModel):
             if in_think:
                 yield "</think>"
             err_msg = e.read().decode("utf-8", errors="ignore")
-            yield from self._stream_text(f"Google stream failed: HTTP Error {e.code} {err_msg}")
+            yield from self._stream_text(
+                f"Google stream failed: HTTP Error {e.code} {err_msg}"
+            )
         except Exception as e:
             if in_think:
                 yield "</think>"
@@ -1296,7 +1392,9 @@ class NvidiaModel(BaseModel):
             raw = resp.read().decode("utf-8")
         return json.loads(raw)
 
-    def _stream_post_json(self, path: str, payload: dict[str, Any], timeout: int | None = None) -> Iterator[dict[str, Any]]:
+    def _stream_post_json(
+        self, path: str, payload: dict[str, Any], timeout: int | None = None
+    ) -> Iterator[dict[str, Any]]:
         body = json.dumps(payload).encode("utf-8")
         req = Request(
             f"{self.base_url}{path}",
@@ -1305,7 +1403,9 @@ class NvidiaModel(BaseModel):
             method="POST",
         )
         req.add_header("Accept", "text/event-stream")
-        effective_timeout = timeout if isinstance(timeout, int) and timeout > 0 else self.timeout
+        effective_timeout = (
+            timeout if isinstance(timeout, int) and timeout > 0 else self.timeout
+        )
         with urlopen(req, timeout=effective_timeout) as resp:  # nosec B310
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="ignore").strip()
@@ -1324,7 +1424,9 @@ class NvidiaModel(BaseModel):
                 except json.JSONDecodeError:
                     continue
 
-    def _chat_payload(self, messages: list[dict[str, str]], stream: bool) -> dict[str, Any]:
+    def _chat_payload(
+        self, messages: list[dict[str, str]], stream: bool
+    ) -> dict[str, Any]:
         compatible_messages = []
         for m in messages:
             role = m.get("role", "user")
@@ -1406,7 +1508,9 @@ class NvidiaModel(BaseModel):
         payload = self._chat_payload(messages, stream=True)
         emitted = False
         try:
-            for data in self._stream_post_json("/chat/completions", payload, timeout=self.stream_timeout):
+            for data in self._stream_post_json(
+                "/chat/completions", payload, timeout=self.stream_timeout
+            ):
                 _, content = self._extract_stream_delta(data)
                 if content:
                     yield content
@@ -1415,7 +1519,9 @@ class NvidiaModel(BaseModel):
                 yield from self._stream_text(self.generate(messages))
         except HTTPError as e:
             err_msg = e.read().decode("utf-8", errors="ignore")
-            yield from self._stream_text(f"Nvidia stream failed: HTTP Error {e.code} {err_msg}")
+            yield from self._stream_text(
+                f"Nvidia stream failed: HTTP Error {e.code} {err_msg}"
+            )
         except Exception as e:
             fallback_text = self.generate(messages)
             if "Nvidia request failed" in fallback_text:
@@ -1478,7 +1584,9 @@ def _fetch_openrouter_models(
         method="GET",
     )
     try:
-        with urlopen(req, timeout=timeout) as resp:  # nosec B310 - HTTPS OpenRouter endpoint
+        with urlopen(
+            req, timeout=timeout
+        ) as resp:  # nosec B310 - HTTPS OpenRouter endpoint
             raw = resp.read().decode("utf-8")
         payload = json.loads(raw)
         data = payload.get("data", [])
@@ -1499,6 +1607,7 @@ def _extract_openrouter_context_window(model_payload: dict[str, Any]) -> int | N
         "max_completion_tokens",
         "max_output_tokens",
     )
+
     def _to_positive_int(value: Any) -> int | None:
         if isinstance(value, int) and value > 0:
             return value
@@ -1510,6 +1619,7 @@ def _extract_openrouter_context_window(model_payload: dict[str, Any]) -> int | N
                 n = int(raw)
                 return n if n > 0 else None
         return None
+
     for key in keys:
         parsed = _to_positive_int(model_payload.get(key))
         if parsed:
@@ -1528,7 +1638,9 @@ def list_openrouter_models(
     base_url: str = "https://openrouter.ai/api/v1",
     timeout: int = 20,
 ) -> list[str]:
-    data, _ = _fetch_openrouter_models(api_key=api_key, base_url=base_url, timeout=timeout)
+    data, _ = _fetch_openrouter_models(
+        api_key=api_key, base_url=base_url, timeout=timeout
+    )
     names: list[str] = []
     for item in data:
         if not isinstance(item, dict):
@@ -1553,7 +1665,9 @@ def build_model(
         provider_key = "auto"
 
     api_key = (openrouter_api_key or os.getenv("OPENROUTER_API_KEY", "")).strip()
-    g_api_key = (google_api_key or os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", ""))).strip()
+    g_api_key = (
+        google_api_key or os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+    ).strip()
     n_api_key = (nvidia_api_key or os.getenv("NVIDIA_API_KEY", "")).strip()
     connect_log: list[str] = []
 
@@ -1604,7 +1718,9 @@ def build_model(
             fb.connect_log = connect_log
             return fb
         connect_log.append(f"[try] openrouter @ {openrouter_url}")
-        model_payloads, reachable = _fetch_openrouter_models(api_key=api_key, base_url=openrouter_url, timeout=12)
+        model_payloads, reachable = _fetch_openrouter_models(
+            api_key=api_key, base_url=openrouter_url, timeout=12
+        )
         if not reachable:
             connect_log.append("[fail] openrouter unavailable or unauthorized")
             fb = FallbackModel(reason="OpenRouter unavailable or unauthorized")
@@ -1613,12 +1729,16 @@ def build_model(
         available_models = [
             str(item.get("id", "")).strip()
             for item in model_payloads
-            if isinstance(item, dict) and isinstance(item.get("id"), str) and str(item.get("id", "")).strip()
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and str(item.get("id", "")).strip()
         ]
         resolved_model, model_note = _pick_openrouter_model(
             available=available_models,
             requested=model_name,
-            env_fallback=os.getenv("OPENROUTER_FALLBACK_MODEL", "arcee-ai/trinity-large-preview:free"),
+            env_fallback=os.getenv(
+                "OPENROUTER_FALLBACK_MODEL", "arcee-ai/trinity-large-preview:free"
+            ),
         )
         if resolved_model != model_name:
             connect_log.append(f"[warn] requested model '{model_name}' unavailable")
@@ -1627,7 +1747,10 @@ def build_model(
             connect_log.append(f"[ok] using requested model '{resolved_model}'")
         context_window = None
         for item in model_payloads:
-            if isinstance(item, dict) and str(item.get("id", "")).strip() == resolved_model:
+            if (
+                isinstance(item, dict)
+                and str(item.get("id", "")).strip() == resolved_model
+            ):
                 context_window = _extract_openrouter_context_window(item)
                 break
         if context_window:
@@ -1646,7 +1769,9 @@ def build_model(
         )
         if openrouter.provider_order:
             mode = "only" if openrouter.provider_only else "order"
-            connect_log.append(f"[ok] provider routing: {mode}={openrouter.provider_order}")
+            connect_log.append(
+                f"[ok] provider routing: {mode}={openrouter.provider_order}"
+            )
         openrouter.connect_log = connect_log
         return openrouter
 
@@ -1664,19 +1789,25 @@ def build_model(
     connect_log.append("[fail] auto ollama unavailable")
     if api_key:
         connect_log.append(f"[try] auto->openrouter @ {openrouter_url}")
-        model_payloads, reachable = _fetch_openrouter_models(api_key=api_key, base_url=openrouter_url, timeout=12)
+        model_payloads, reachable = _fetch_openrouter_models(
+            api_key=api_key, base_url=openrouter_url, timeout=12
+        )
         if not reachable:
             connect_log.append("[fail] auto openrouter unavailable or unauthorized")
         else:
             available_models = [
                 str(item.get("id", "")).strip()
                 for item in model_payloads
-                if isinstance(item, dict) and isinstance(item.get("id"), str) and str(item.get("id", "")).strip()
+                if isinstance(item, dict)
+                and isinstance(item.get("id"), str)
+                and str(item.get("id", "")).strip()
             ]
             resolved_model, model_note = _pick_openrouter_model(
                 available=available_models,
                 requested=model_name,
-                env_fallback=os.getenv("OPENROUTER_FALLBACK_MODEL", "arcee-ai/trinity-large-preview:free"),
+                env_fallback=os.getenv(
+                    "OPENROUTER_FALLBACK_MODEL", "arcee-ai/trinity-large-preview:free"
+                ),
             )
             if resolved_model != model_name:
                 connect_log.append(f"[warn] requested model '{model_name}' unavailable")
@@ -1685,7 +1816,10 @@ def build_model(
                 connect_log.append(f"[ok] using requested model '{resolved_model}'")
             context_window = None
             for item in model_payloads:
-                if isinstance(item, dict) and str(item.get("id", "")).strip() == resolved_model:
+                if (
+                    isinstance(item, dict)
+                    and str(item.get("id", "")).strip() == resolved_model
+                ):
                     context_window = _extract_openrouter_context_window(item)
                     break
             if context_window:
@@ -1704,7 +1838,9 @@ def build_model(
             )
             if openrouter.provider_order:
                 mode = "only" if openrouter.provider_only else "order"
-                connect_log.append(f"[ok] provider routing: {mode}={openrouter.provider_order}")
+                connect_log.append(
+                    f"[ok] provider routing: {mode}={openrouter.provider_order}"
+                )
             openrouter.connect_log = connect_log
             return openrouter
     else:

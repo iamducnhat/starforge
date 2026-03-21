@@ -1,5 +1,7 @@
 import unittest
+
 from assistant.tool_calls import parse_tool_calls
+
 
 class TestToolCalls(unittest.TestCase):
     def test_parse_single_tool_call(self):
@@ -35,6 +37,7 @@ class TestToolCalls(unittest.TestCase):
     def test_malformed_args(self):
         text = '{"tool": "test", "args": "not a dict"}'
         self.assertEqual(parse_tool_calls(text), [])
+
 
 if __name__ == "__main__":
     unittest.main()

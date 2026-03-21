@@ -17,11 +17,12 @@ memory/tool_finetune_samples.jsonl
 memory/tool_supervision.jsonl
 memory/plans/*.json
 memory/blocks/
+workspaces/
+memory/sessions/
+finetune/
+functions/
 
 # Optional local virtual envs
 .venv/
 venv/
 env/
-
-# Fine-tune outputs/checkpoints
-finetune/output/

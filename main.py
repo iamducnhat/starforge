@@ -4,10 +4,10 @@ import argparse
 import os
 from pathlib import Path
 
-from assistant.cli_format import print_formatted_output, print_tool_event
-from assistant.logging_config import setup_logging
 from assistant.chat_engine import ChatEngine
+from assistant.cli_format import print_formatted_output, print_tool_event
 from assistant.functions_registry import FunctionRegistry
+from assistant.logging_config import setup_logging
 from assistant.memory import MemoryStore
 from assistant.model import build_model, list_openrouter_models
 from assistant.prompt import SYSTEM_PROMPT
@@ -35,7 +35,9 @@ def load_dotenv(path: str | Path | None = None) -> None:
         if not key:
             continue
         value = value.strip()
-        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
             value = value[1:-1]
         os.environ.setdefault(key, value)
 
@@ -230,6 +232,7 @@ def main() -> None:
 
     if args.server:
         from assistant.server import start_server
+
         start_server(engine, host=args.host, port=args.port)
         return
 

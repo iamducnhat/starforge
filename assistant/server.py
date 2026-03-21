@@ -23,6 +23,7 @@ Design goals
   system prompt for that request, allowing Xcode / the user to inject
   their own context.
 """
+
 from __future__ import annotations
 
 import json
@@ -74,6 +75,7 @@ engine: Optional[ChatEngine] = None
 # ---------------------------------------------------------------------------
 # Pydantic request / response models
 # ---------------------------------------------------------------------------
+
 
 class ChatToolCallFunction(BaseModel):
     name: str
@@ -151,6 +153,7 @@ class ChatCompletionRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helper: build a per-request ChatEngine
 # ---------------------------------------------------------------------------
+
 
 def _build_request_engine(request: ChatCompletionRequest) -> tuple[ChatEngine, str]:
     """
@@ -241,6 +244,7 @@ def _token_estimate(text: str) -> int:
 # Routes
 # ---------------------------------------------------------------------------
 
+
 @app.get("/")
 async def root():
     """Informal status endpoint."""
@@ -293,13 +297,15 @@ async def list_models():
 
     data = []
     for mid in model_ids:
-        data.append({
-            "id": mid,
-            "object": "model",
-            "created": created,
-            "owned_by": "assistant" if mid == actual_model_id else "openai",
-            "permission": [],
-        })
+        data.append(
+            {
+                "id": mid,
+                "object": "model",
+                "created": created,
+                "owned_by": "assistant" if mid == actual_model_id else "openai",
+                "permission": [],
+            }
+        )
 
     return {"object": "list", "data": data}
 
@@ -327,7 +333,6 @@ async def chat_completions(request: ChatCompletionRequest):
         flush=True,
     )
     _t0 = time.time()
-
 
     # ------------------------------------------------------------------
     # Non-streaming path
@@ -505,7 +510,10 @@ async def chat_completions(request: ChatCompletionRequest):
 # Server entry-point
 # ---------------------------------------------------------------------------
 
-def start_server(chat_engine: ChatEngine, host: str = "0.0.0.0", port: int = 8000) -> None:
+
+def start_server(
+    chat_engine: ChatEngine, host: str = "0.0.0.0", port: int = 8000
+) -> None:
     """
     Start the uvicorn server.
 
@@ -514,5 +522,6 @@ def start_server(chat_engine: ChatEngine, host: str = "0.0.0.0", port: int = 800
     global engine
     engine = chat_engine
     import uvicorn
+
     logger.info("Starting OpenAI-compatible API server on %s:%d", host, port)
     uvicorn.run(app, host=host, port=port, log_level="warning")

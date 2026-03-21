@@ -7,7 +7,6 @@ from typing import Any
 
 from .utils import redact_secrets_obj, redact_secrets_text
 
-
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -100,7 +99,9 @@ class MarkdownAnsiRenderer:
         if listing:
             indent, marker, body = listing.groups()
             body = self._format_inline(body, MD_TEXT)
-            return f"{MD_TEXT}{indent}{MD_LIST_MARK}{marker}{RESET}{MD_TEXT} {body}{RESET}"
+            return (
+                f"{MD_TEXT}{indent}{MD_LIST_MARK}{marker}{RESET}{MD_TEXT} {body}{RESET}"
+            )
 
         return f"{MD_TEXT}{self._format_inline(line, MD_TEXT)}{RESET}"
 
@@ -118,9 +119,15 @@ class MarkdownAnsiRenderer:
 
 
 def _split_thinking_and_answer(response: str) -> tuple[str, str]:
-    think_chunks = re.findall(r"<think>(.*?)</think>", response, flags=re.DOTALL | re.IGNORECASE)
-    thinking = "\n".join(chunk.strip() for chunk in think_chunks if chunk.strip()).strip()
-    answer = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL | re.IGNORECASE)
+    think_chunks = re.findall(
+        r"<think>(.*?)</think>", response, flags=re.DOTALL | re.IGNORECASE
+    )
+    thinking = "\n".join(
+        chunk.strip() for chunk in think_chunks if chunk.strip()
+    ).strip()
+    answer = re.sub(
+        r"<think>.*?</think>", "", response, flags=re.DOTALL | re.IGNORECASE
+    )
     answer = answer.replace("<think>", "").replace("</think>", "").strip()
     return thinking, answer
 
@@ -265,11 +272,19 @@ class StreamRenderer:
                     safe = max(0, len(self._buffer) - (len(self.THINK_CLOSE) - 1))
                     if safe == 0:
                         return
-                    cleaned = self._buffer[:safe].replace(self.THINK_OPEN, "").replace(self.THINK_CLOSE, "")
+                    cleaned = (
+                        self._buffer[:safe]
+                        .replace(self.THINK_OPEN, "")
+                        .replace(self.THINK_CLOSE, "")
+                    )
                     self._write(cleaned)
                     self._buffer = self._buffer[safe:]
                     return
-                cleaned = self._buffer[:idx].replace(self.THINK_OPEN, "").replace(self.THINK_CLOSE, "")
+                cleaned = (
+                    self._buffer[:idx]
+                    .replace(self.THINK_OPEN, "")
+                    .replace(self.THINK_CLOSE, "")
+                )
                 self._write(cleaned)
                 self._buffer = self._buffer[idx + len(self.THINK_CLOSE) :]
                 self._pending_think_end = True
@@ -302,7 +317,9 @@ class StreamRenderer:
 
         if self._buffer:
             if self._in_think:
-                cleaned = self._buffer.replace(self.THINK_OPEN, "").replace(self.THINK_CLOSE, "")
+                cleaned = self._buffer.replace(self.THINK_OPEN, "").replace(
+                    self.THINK_CLOSE, ""
+                )
                 self._write(cleaned)
             else:
                 cleaned = self._buffer.replace(self.THINK_CLOSE, "")
@@ -331,6 +348,7 @@ def print_phase(label: str) -> None:
       ◆ 22:03:03  recovering action…
     """
     import time as _t
+
     ts = _t.strftime("%H:%M:%S")
     sys.stdout.write(f"{DIM}{CYAN}◆ {ts}  {label}{RESET}\n")
     sys.stdout.flush()
@@ -339,6 +357,7 @@ def print_phase(label: str) -> None:
 def _now_ts() -> str:
     """HH:MM:SS timestamp for log lines."""
     import time as _time
+
     t = _time.localtime()
     return f"{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}"
 
@@ -361,7 +380,9 @@ def print_tool_event(name: str, args: dict[str, Any], result: dict[str, Any]) ->
 
     ts = _now_ts()
     print(f"{DIM}{'─'*60}{RESET}")
-    print(f"{BOLD}{MAGENTA}[{ts}] tool ▶ {TOOL_LABEL}{name}{RESET}  {DIM}{status_icon}{RESET}")
+    print(
+        f"{BOLD}{MAGENTA}[{ts}] tool ▶ {TOOL_LABEL}{name}{RESET}  {DIM}{status_icon}{RESET}"
+    )
     print(f"  {DIM}{BLUE}args   :{RESET} {args_text}")
     print(f"  {DIM}{BLUE}result :{RESET} {result_text}")
 
@@ -373,6 +394,7 @@ def print_tool_start(name: str, args: dict[str, Any]) -> None:
         args_text = args_text[:197] + "…"
     ts = _now_ts()
     print(f"{DIM}{'─'*60}{RESET}")
-    print(f"{BOLD}{MAGENTA}[{ts}] tool ▶ {TOOL_LABEL}{name}{RESET}  {DIM}(starting…){RESET}")
+    print(
+        f"{BOLD}{MAGENTA}[{ts}] tool ▶ {TOOL_LABEL}{name}{RESET}  {DIM}(starting…){RESET}"
+    )
     print(f"  {DIM}{BLUE}args   :{RESET} {args_text}")
-

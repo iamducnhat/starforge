@@ -10,7 +10,9 @@ from urllib.request import Request, urlopen
 
 def _http_get(url: str, timeout: int = 15) -> str:
     req = Request(url, headers={"User-Agent": "LocalCodingAssistant/1.0"})
-    with urlopen(req, timeout=timeout) as resp:  # nosec B310 - controlled URL construction
+    with urlopen(
+        req, timeout=timeout
+    ) as resp:  # nosec B310 - controlled URL construction
         data = resp.read()
     return data.decode("utf-8", errors="ignore")
 
@@ -53,7 +55,9 @@ def _extract_page_text(html_text: str, max_chars: int = 2200) -> str:
 def _extract_title(html_text: str) -> str:
     if not html_text:
         return ""
-    m = re.search(r"<title[^>]*>(.*?)</title>", html_text, flags=re.IGNORECASE | re.DOTALL)
+    m = re.search(
+        r"<title[^>]*>(.*?)</title>", html_text, flags=re.IGNORECASE | re.DOTALL
+    )
     if not m:
         return ""
     return _strip_tags(m.group(1)).strip()
@@ -174,14 +178,20 @@ def _parse_ddg_html_results(page: str) -> list[dict[str, str]]:
 
 def _parse_ddg_lite_results(page: str) -> list[dict[str, str]]:
     # Fallback parser for lite endpoint when HTML endpoint shape changes.
-    anchor_pattern = re.compile(r'<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+    anchor_pattern = re.compile(
+        r'<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL
+    )
     out: list[dict[str, str]] = []
     for href, title_html in anchor_pattern.findall(page):
-        out.append({"title": _strip_tags(title_html), "url": href.strip(), "snippet": ""})
+        out.append(
+            {"title": _strip_tags(title_html), "url": href.strip(), "snippet": ""}
+        )
     return out
 
 
-def _search_duckduckgo(query: str, max_results: int, result_pages: int, timeout: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _search_duckduckgo(
+    query: str, max_results: int, result_pages: int, timeout: int
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     results: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
     pages_scanned = 0
@@ -214,7 +224,11 @@ def _search_duckduckgo(query: str, max_results: int, result_pages: int, timeout:
             break
 
     if results:
-        return results, {"engine": endpoint, "pages_scanned": pages_scanned, "had_error": had_error}
+        return results, {
+            "engine": endpoint,
+            "pages_scanned": pages_scanned,
+            "had_error": had_error,
+        }
 
     # Fallback to lite endpoint.
     endpoint = "duckduckgo_lite"
@@ -233,7 +247,11 @@ def _search_duckduckgo(query: str, max_results: int, result_pages: int, timeout:
     except Exception:
         had_error = True
 
-    return results, {"engine": endpoint, "pages_scanned": pages_scanned, "had_error": had_error}
+    return results, {
+        "engine": endpoint,
+        "pages_scanned": pages_scanned,
+        "had_error": had_error,
+    }
 
 
 def search_web(
@@ -244,7 +262,11 @@ def search_web(
     level: str = "auto",
 ) -> dict[str, Any]:
     if not query.strip():
-        return {"query": query, "results": [], "meta": {"level_requested": level, "level_used": "quick"}}
+        return {
+            "query": query,
+            "results": [],
+            "meta": {"level_requested": level, "level_used": "quick"},
+        }
 
     profile = _resolve_profile(
         query=query,
@@ -295,7 +317,9 @@ def search_web(
             if len(page_excerpt) < 80:
                 page_excerpt = str(item.get("snippet", "")).strip()
             item["page_excerpt"] = page_excerpt
-            item["code_snippets"] = extract_code_snippets(page_html, max_snippets=4, max_chars=700)
+            item["code_snippets"] = extract_code_snippets(
+                page_html, max_snippets=4, max_chars=700
+            )
         except Exception as e:  # pragma: no cover
             item["page_fetched"] = False
             item["page_error"] = str(e)
@@ -334,10 +358,14 @@ def read_web(
             "url": target,
             "title": _extract_title(html_text),
             "text": text,
-            "code_snippets": extract_code_snippets(html_text, max_snippets=8, max_chars=700),
+            "code_snippets": extract_code_snippets(
+                html_text, max_snippets=8, max_chars=700
+            ),
         }
         if include_links:
-            result["links"] = _extract_links(html_text, base_url=target, max_links=max_links)
+            result["links"] = _extract_links(
+                html_text, base_url=target, max_links=max_links
+            )
         return result
     except Exception as e:
         return {"ok": False, "url": target, "error": str(e)}
@@ -373,7 +401,9 @@ def scrape_web(
 
         try:
             html_text = _http_get(current, timeout=timeout)
-            links = _extract_links(html_text, base_url=current, max_links=max_links_per_page)
+            links = _extract_links(
+                html_text, base_url=current, max_links=max_links_per_page
+            )
             all_links.update(links)
 
             page_record = {
@@ -417,12 +447,16 @@ def scrape_web(
     }
 
 
-def extract_code_snippets(html_text: str, max_snippets: int = 8, max_chars: int = 700) -> list[str]:
+def extract_code_snippets(
+    html_text: str, max_snippets: int = 8, max_chars: int = 700
+) -> list[str]:
     if not html_text:
         return []
 
     patterns = [
-        re.compile(r"<pre[^>]*>\s*<code[^>]*>(.*?)</code>\s*</pre>", re.IGNORECASE | re.DOTALL),
+        re.compile(
+            r"<pre[^>]*>\s*<code[^>]*>(.*?)</code>\s*</pre>", re.IGNORECASE | re.DOTALL
+        ),
         re.compile(r"<pre[^>]*>(.*?)</pre>", re.IGNORECASE | re.DOTALL),
         re.compile(r"<code[^>]*>(.*?)</code>", re.IGNORECASE | re.DOTALL),
     ]

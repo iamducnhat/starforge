@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -11,8 +12,8 @@ from .utils import get_env_float, get_env_int, normalize_keywords
 from .web import extract_code_snippets, read_web, scrape_web, search_web
 from .workspace_tools import WorkspaceTools
 
-
 logger = get_logger(__name__)
+
 
 class ToolSystem:
     def __init__(
@@ -24,10 +25,20 @@ class ToolSystem:
         self.memory_store = memory_store
         self.function_registry = function_registry
         self.workspace_tools = workspace_tools
+        self.tool_max_retries = max(1, min(get_env_int("ASSISTANT_TOOL_RETRIES", 2), 5))
+        self.tool_retry_backoff = max(
+            0.05, min(get_env_float("ASSISTANT_TOOL_RETRY_BACKOFF", 0.35), 3.0)
+        )
         self._tools: dict[str, Callable[..., Any]] = {
             "find_in_memory": self.find_in_memory,
+            "search_memory": self.search_memory,
+            "record_memory_feedback": self.record_memory_feedback,
             "create_block": self.create_block,
             "create_function": self.create_function,
+            "create_skill": self.create_skill,
+            "list_skills": self.list_skills,
+            "find_skills": self.find_skills,
+            "record_skill_outcome": self.record_skill_outcome,
             "search_web": self.search_web,
             "read_web": self.read_web,
             "scrape_web": self.scrape_web,
@@ -41,6 +52,14 @@ class ToolSystem:
             "write_file": self.write_file,
             "edit_file": self.edit_file,
             "search_project": self.search_project,
+            "index_symbols": self.index_symbols,
+            "lookup_symbol": self.lookup_symbol,
+            "summarize_file": self.summarize_file,
+            "detect_project_context": self.detect_project_context,
+            "execute_command": self.execute_command,
+            "run_tests": self.run_tests,
+            "get_git_diff": self.get_git_diff,
+            "validate_workspace_changes": self.validate_workspace_changes,
             "create_plan": self.create_plan,
             "list_plans": self.list_plans,
             "get_plan": self.get_plan,
@@ -60,23 +79,133 @@ class ToolSystem:
 
         args = args or {}
         logger.debug(f"Executing tool: {name} with args: {args}")
-        try:
-            result = self._tools[name](**args)
-            if isinstance(result, dict) and "ok" in result:
-                if not result.get("ok"):
-                    logger.warning(f"Tool {name} returned error: {result.get('error')}")
+        return self.safe_tool_call(name=name, args=args)
+
+    @staticmethod
+    def _normalize_tool_result(result: Any) -> dict[str, Any]:
+        if isinstance(result, dict) and "ok" in result:
+            return result
+        return {"ok": True, "result": result}
+
+    @staticmethod
+    def _is_retryable_error(error: str) -> bool:
+        t = (error or "").lower()
+        retry_markers = (
+            "timeout",
+            "timed out",
+            "temporarily",
+            "temporary",
+            "rate limit",
+            "429",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "network",
+            "dns",
+            "unavailable",
+            "too many requests",
+        )
+        return any(m in t for m in retry_markers)
+
+    def _fallback_args(
+        self, tool_name: str, args: dict[str, Any], result: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        def _int_or(value: Any, default: int) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return default
+
+        if result.get("ok", True):
+            return None
+        fallback = dict(args)
+        if tool_name == "search_web":
+            fallback["level"] = "quick"
+            fallback["max_results"] = min(_int_or(fallback.get("max_results", 5), 5), 5)
+            fallback["fetch_top_pages"] = min(
+                _int_or(fallback.get("fetch_top_pages", 1), 1), 1
+            )
+            fallback["page_timeout"] = min(
+                _int_or(fallback.get("page_timeout", 8), 8), 8
+            )
+            return fallback if fallback != args else None
+        if tool_name == "read_web":
+            fallback["timeout"] = min(_int_or(fallback.get("timeout", 8), 8), 8)
+            fallback["max_chars"] = min(
+                _int_or(fallback.get("max_chars", 6000), 6000), 6000
+            )
+            return fallback if fallback != args else None
+        if tool_name == "scrape_web":
+            fallback["max_pages"] = min(_int_or(fallback.get("max_pages", 8), 8), 8)
+            fallback["max_depth"] = min(_int_or(fallback.get("max_depth", 1), 1), 1)
+            fallback["timeout"] = min(_int_or(fallback.get("timeout", 8), 8), 8)
+            return fallback if fallback != args else None
+        return None
+
+    def safe_tool_call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        attempts = 0
+        used_fallback = False
+        current_args = dict(args)
+
+        while True:
+            attempts += 1
+            try:
+                raw = self._tools[name](**current_args)
+                result = self._normalize_tool_result(raw)
+            except TypeError as e:
+                logger.error(f"Invalid arguments for tool {name}: {e}")
+                return {
+                    "ok": False,
+                    "error": f"invalid args for {name}: {e}",
+                    "attempts": attempts,
+                }
+            except Exception as e:  # pragma: no cover
+                logger.exception(f"Tool execution failed: {name}: {e}")
+                result = {"ok": False, "error": f"tool execution failed: {e}"}
+
+            result["attempts"] = attempts
+            if result.get("ok", False):
+                if used_fallback:
+                    result["fallback_used"] = True
                 return result
-            return {"ok": True, "result": result}
-        except TypeError as e:
-            logger.error(f"Invalid arguments for tool {name}: {e}")
-            return {"ok": False, "error": f"invalid args for {name}: {e}"}
-        except Exception as e:  # pragma: no cover
-            logger.exception(f"Tool execution failed: {name}: {e}")
-            return {"ok": False, "error": f"tool execution failed: {e}"}
+
+            error_text = str(result.get("error", ""))
+            if attempts <= self.tool_max_retries and self._is_retryable_error(error_text):
+                delay = min(5.0, self.tool_retry_backoff * attempts)
+                logger.warning(
+                    f"Tool {name} failed with retryable error (attempt {attempts}/{self.tool_max_retries}): {error_text}"
+                )
+                time.sleep(delay)
+                continue
+
+            if not used_fallback:
+                fallback_args = self._fallback_args(name, current_args, result)
+                if fallback_args is not None:
+                    logger.warning(f"Tool {name} failed, trying fallback arguments")
+                    used_fallback = True
+                    current_args = fallback_args
+                    continue
+
+            logger.warning(f"Tool {name} returned error: {result.get('error')}")
+            return result
 
     def find_in_memory(self, keywords: list[str]) -> dict[str, Any]:
         matches = self.memory_store.find_in_memory(keywords)
         return {"ok": True, "matches": matches}
+
+    def search_memory(self, query: str, limit: int = 5) -> dict[str, Any]:
+        matches = self.memory_store.semantic_search(query=query, limit=limit)
+        return {"ok": True, "query": query, "matches": matches}
+
+    def record_memory_feedback(
+        self, block_name: str, success: bool, confidence: float = 1.0, source: str = "runtime"
+    ) -> dict[str, Any]:
+        return self.memory_store.record_feedback(
+            block_name=block_name,
+            success=success,
+            confidence=confidence,
+            source=source,
+        )
 
     def create_block(
         self,
@@ -114,7 +243,44 @@ class ToolSystem:
             tool_calls=tool_calls,
         )
 
-    def run_function(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+    def create_skill(
+        self,
+        name: str,
+        description: str,
+        keywords: list[str],
+        code: str = "",
+        tool_name: str = "",
+        tool_args: dict[str, Any] | None = None,
+        tool_calls: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return self.function_registry.create_skill(
+            name=name,
+            description=description,
+            keywords=keywords,
+            code=code,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            tool_calls=tool_calls,
+        )
+
+    def list_skills(self, limit: int = 50, query: str = "", min_score: float = 0.0) -> dict[str, Any]:
+        return self.function_registry.list_skills(
+            limit=limit, query=query, min_score=min_score
+        )
+
+    def find_skills(self, query: str, limit: int = 5) -> dict[str, Any]:
+        return self.function_registry.find_skills(query=query, limit=limit)
+
+    def record_skill_outcome(
+        self, name: str, success: bool, confidence: float = 1.0, notes: str = ""
+    ) -> dict[str, Any]:
+        return self.function_registry.record_skill_outcome(
+            name=name, success=success, confidence=confidence, notes=notes
+        )
+
+    def run_function(
+        self, name: str, args: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """
         Execute a previously registered function.
 
@@ -150,7 +316,9 @@ class ToolSystem:
         }
 
     @staticmethod
-    def _web_keywords(query: str, results: list[dict[str, Any]], limit: int = 10) -> list[str]:
+    def _web_keywords(
+        query: str, results: list[dict[str, Any]], limit: int = 10
+    ) -> list[str]:
         stop = {
             "to",
             "in",
@@ -180,7 +348,9 @@ class ToolSystem:
         }
         words = re.findall(r"[a-zA-Z0-9_]{2,}", query.lower())
         for item in results[:5]:
-            words.extend(re.findall(r"[a-zA-Z0-9_]{2,}", str(item.get("title", "")).lower()))
+            words.extend(
+                re.findall(r"[a-zA-Z0-9_]{2,}", str(item.get("title", "")).lower())
+            )
 
         out: list[str] = []
         seen = set()
@@ -195,7 +365,11 @@ class ToolSystem:
         return normalize_keywords(out) or ["web", "search"]
 
     @staticmethod
-    def _web_knowledge(query: str, results: list[dict[str, Any]], search_meta: dict[str, Any] | None = None) -> str:
+    def _web_knowledge(
+        query: str,
+        results: list[dict[str, Any]],
+        search_meta: dict[str, Any] | None = None,
+    ) -> str:
         search_meta = search_meta or {}
         lines = [
             "## Compressed Summary",
@@ -261,7 +435,11 @@ class ToolSystem:
         saved_block: dict[str, Any] | None = None
 
         if results:
-            sources = [str(item.get("url", "")).strip() for item in results if str(item.get("url", "")).strip()]
+            sources = [
+                str(item.get("url", "")).strip()
+                for item in results
+                if str(item.get("url", "")).strip()
+            ]
             try:
                 saved_block = self.memory_store.create_block(
                     name=f"web_{query[:64]}",
@@ -346,8 +524,12 @@ class ToolSystem:
             max_chars=max_chars,
         )
 
-    def create_file(self, path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
-        return self.workspace_tools.create_file(path=path, content=content, overwrite=overwrite)
+    def create_file(
+        self, path: str, content: str, overwrite: bool = False
+    ) -> dict[str, Any]:
+        return self.workspace_tools.create_file(
+            path=path, content=content, overwrite=overwrite
+        )
 
     def create_folder(self, path: str) -> dict[str, Any]:
         return self.workspace_tools.create_folder(path=path)
@@ -355,12 +537,20 @@ class ToolSystem:
     def delete_file(self, path: str) -> dict[str, Any]:
         return self.workspace_tools.delete_file(path=path)
 
-    def run_terminal(self, action: str, cmd: str | None = None, session_id: str = "default") -> dict[str, Any]:
-        return self.workspace_tools.run_terminal(action=action, cmd=cmd, session_id=session_id)
+    def run_terminal(
+        self, action: str, cmd: str | None = None, session_id: str = "default"
+    ) -> dict[str, Any]:
+        return self.workspace_tools.run_terminal(
+            action=action, cmd=cmd, session_id=session_id
+        )
 
-    def write_file(self, path: str, content: str, append: bool = False) -> dict[str, Any]:
+    def write_file(
+        self, path: str, content: str, append: bool = False
+    ) -> dict[str, Any]:
         # Backward-compatible alias.
-        return self.workspace_tools.write_file(path=path, content=content, append=append)
+        return self.workspace_tools.write_file(
+            path=path, content=content, append=append
+        )
 
     def edit_file(
         self,
@@ -394,6 +584,98 @@ class ToolSystem:
             max_matches=max_matches,
         )
 
+    def index_symbols(
+        self,
+        path: str = ".",
+        glob: str = "**/*",
+        max_files: int = 300,
+        max_symbols: int = 5000,
+    ) -> dict[str, Any]:
+        return self.workspace_tools.index_symbols(
+            path=path,
+            glob=glob,
+            max_files=max_files,
+            max_symbols=max_symbols,
+        )
+
+    def lookup_symbol(
+        self,
+        symbol: str,
+        path: str = ".",
+        glob: str = "**/*",
+        exact: bool = False,
+        max_results: int = 30,
+    ) -> dict[str, Any]:
+        return self.workspace_tools.lookup_symbol(
+            symbol=symbol,
+            path=path,
+            glob=glob,
+            exact=exact,
+            max_results=max_results,
+        )
+
+    def summarize_file(self, path: str, max_symbols: int = 20) -> dict[str, Any]:
+        return self.workspace_tools.summarize_file(
+            path=path,
+            max_symbols=max_symbols,
+        )
+
+    def detect_project_context(
+        self, path: str = ".", include_runtime: bool = True
+    ) -> dict[str, Any]:
+        return self.workspace_tools.detect_project_context(
+            path=path, include_runtime=include_runtime
+        )
+
+    def execute_command(
+        self,
+        cmd: str,
+        path: str = ".",
+        timeout: int = 120,
+        max_output_chars: int = 12000,
+    ) -> dict[str, Any]:
+        return self.workspace_tools.execute_command(
+            cmd=cmd,
+            path=path,
+            timeout=timeout,
+            max_output_chars=max_output_chars,
+        )
+
+    def run_tests(
+        self,
+        path: str = ".",
+        runner: str = "auto",
+        args: str = "",
+        timeout: int = 300,
+    ) -> dict[str, Any]:
+        return self.workspace_tools.run_tests(
+            path=path,
+            runner=runner,
+            args=args,
+            timeout=timeout,
+        )
+
+    def get_git_diff(
+        self, path: str = ".", staged: bool = False, max_chars: int = 12000
+    ) -> dict[str, Any]:
+        return self.workspace_tools.get_git_diff(
+            path=path, staged=staged, max_chars=max_chars
+        )
+
+    def validate_workspace_changes(
+        self,
+        path: str = ".",
+        test_runner: str = "auto",
+        test_args: str = "",
+        timeout: int = 300,
+    ) -> dict[str, Any]:
+        return self.workspace_tools.validate_workspace_changes(
+            path=path,
+            test_runner=test_runner,
+            test_args=test_args,
+            timeout=timeout,
+        )
+
     def create_plan(self, title: str, goal: str, steps: list[str]) -> dict[str, Any]:
         return self.workspace_tools.create_plan(title=title, goal=goal, steps=steps)
 
@@ -407,4 +689,6 @@ class ToolSystem:
         return self.workspace_tools.add_todo(plan_id=plan_id, text=text)
 
     def update_todo(self, plan_id: str, todo_id: int, status: str) -> dict[str, Any]:
-        return self.workspace_tools.update_todo(plan_id=plan_id, todo_id=todo_id, status=status)
+        return self.workspace_tools.update_todo(
+            plan_id=plan_id, todo_id=todo_id, status=status
+        )
