@@ -49,8 +49,6 @@ It:
 * improves over time (strategies + skills + trajectories)
 * works directly inside your codebase
 
----
-
 ## Demo
 
 ![Starforge Demo](./assets/demo.gif)
@@ -65,15 +63,11 @@ It:
 * validates with tests
 * learns from outcomes
 
----
-
 ### Root-Cause Memory
 
 * stores reusable fixes (not just logs)
 * applies deterministic repair templates
 * confidence-based matching
-
----
 
 ### Strategy + Skill Learning
 
@@ -81,15 +75,11 @@ It:
 * reuses and adapts them
 * builds parameterized skill templates
 
----
-
 ### Autonomous Execution
 
 * DAG-based planning (dependency-aware)
 * execution → validation → scoring → decision
 * retry / replan / repair loops
-
----
 
 ### State-Aware Learning
 
@@ -99,8 +89,6 @@ Each step tracks:
 * tests fixed
 * new errors / regressions
 * progress signals
-
----
 
 ## Recent Feature Updates
 
@@ -112,8 +100,6 @@ Each step tracks:
 * **Runtime guardrails for long sessions**: the engine now compacts oversized history entries, clips large tool payloads before storing them in context, and applies a memory guard that can evict cold memory/skill state, close idle terminals, clear DNS cache, and stop runs that exceed a hard memory limit.
 * **Richer learned skills and memory reuse**: auto-learned skills can now store structured metadata such as `skill`, `inputs`, `steps_template`, and `match_conditions`, while hot caches for strategies, knowledge blocks, root causes, and skills are ranked and trimmed for reuse.
 * **API and research upgrades**: streamed API responses now handle disconnects and queue backpressure more cleanly, streamed usage accounting is available when requested, web search can persist results on demand, and `--autonomous-objective` supports one-shot autonomous runs from the CLI.
-
----
 
 ## What This Means
 
@@ -137,8 +123,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
----
-
 ### 2. Configure
 
 Create `.env`:
@@ -149,15 +133,11 @@ ASSISTANT_MODEL=qwen3:8b
 OLLAMA_URL=http://127.0.0.1:11434
 ```
 
----
-
 ### 3. Run CLI
 
 ```bash
 python3 main.py
 ```
-
----
 
 ### 4. Run Autonomous Mode
 
@@ -177,8 +157,6 @@ python3 main.py --server --host 0.0.0.0 --port 8000
 python3 main.py --autonomous-objective "fix the failing tests" --autonomous-steps 8
 ```
 
----
-
 ## Architecture (High-Level)
 
 * `chat_engine.py` → core loop + autonomous logic
@@ -188,8 +166,6 @@ python3 main.py --autonomous-objective "fix the failing tests" --autonomous-step
 * `server.py` → OpenAI-compatible API
 * `model.py` → provider routing + runtime DNS fallbacks
 
----
-
 ## Memory System
 
 Starforge uses multiple memory layers:
@@ -198,8 +174,6 @@ Starforge uses multiple memory layers:
 * **Strategies** → successful multi-step plans with scored reuse
 * **Root Causes** → deterministic repair patterns with feedback loops
 * **Trajectories** → full execution logs for training
-
----
 
 ## Autonomous Loop
 
@@ -217,8 +191,6 @@ Includes:
 * focused workspace validation with explicit failure modes
 * test-driven repair loop + root-cause and deterministic fast-path fixes
 * convergence controller with retry, replan, and no-progress limits
-
----
 
 ## Fine-Tuning Pipeline
 
@@ -245,8 +217,6 @@ python3 finetune/train_lora_sft.py \
   --train-file finetune/interaction_train.jsonl
 ```
 
----
-
 ## Notes
 
 * filesystem-based (no database)
@@ -254,15 +224,11 @@ python3 finetune/train_lora_sft.py \
 * bounded caches and queues for long-running autonomous sessions
 * designed for iterative improvement, not one-shot answers
 
----
-
 ## Vision
 
 Starforge is a step toward:
 
 > self-improving AI systems that learn from real-world execution
-
----
 
 ## If you find this interesting
 
