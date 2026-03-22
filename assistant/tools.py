@@ -14,6 +14,18 @@ from .workspace_tools import WorkspaceTools
 
 logger = get_logger(__name__)
 
+_TOOL_NAME_ALIASES: dict[str, str] = {
+    "google_search": "search_web",
+    "web_search": "search_web",
+    "search_google": "search_web",
+    "internet_search": "search_web",
+    "websearch": "search_web",
+    "search_manga": "search_web",
+    "manga_search": "search_web",
+    "read_url": "read_web",
+    "crawl_web": "scrape_web",
+}
+
 
 class ToolSystem:
     def __init__(
@@ -33,6 +45,8 @@ class ToolSystem:
             "find_in_memory": self.find_in_memory,
             "search_memory": self.search_memory,
             "record_memory_feedback": self.record_memory_feedback,
+            "find_strategies": self.find_strategies,
+            "record_strategy": self.record_strategy,
             "create_block": self.create_block,
             "create_function": self.create_function,
             "create_skill": self.create_skill,
@@ -72,14 +86,78 @@ class ToolSystem:
     def tool_names(self) -> list[str]:
         return sorted(self._tools.keys())
 
+    @staticmethod
+    def _canonical_tool_name(name: str) -> str:
+        key = str(name or "").strip().lower()
+        if not key:
+            return ""
+        return _TOOL_NAME_ALIASES.get(key, key)
+
+    @staticmethod
+    def _normalize_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(args or {})
+
+        if name == "get_current_datetime":
+            return {}
+
+        if name == "search_web":
+            query = normalized.get("query")
+            if not isinstance(query, str) or not query.strip():
+                queries = normalized.get("queries")
+                if isinstance(queries, list):
+                    for item in queries:
+                        s = str(item).strip()
+                        if s:
+                            normalized["query"] = s
+                            break
+                elif isinstance(queries, str) and queries.strip():
+                    normalized["query"] = queries.strip()
+
+            if "max_results" not in normalized and "limit" in normalized:
+                normalized["max_results"] = normalized.get("limit")
+
+            allowed = {"query", "max_results", "fetch_top_pages", "page_timeout", "level"}
+            normalized = {
+                k: v for k, v in normalized.items() if k in allowed and v is not None
+            }
+            return normalized
+
+        if name == "find_in_memory":
+            keywords = normalized.get("keywords")
+            if isinstance(keywords, str):
+                parts = [p.strip() for p in re.split(r"[,;\n]+", keywords) if p.strip()]
+                normalized["keywords"] = parts if parts else [keywords.strip()]
+            elif not isinstance(keywords, list):
+                query = normalized.get("query")
+                if isinstance(query, str) and query.strip():
+                    normalized["keywords"] = [query.strip()]
+            return {"keywords": normalized.get("keywords", [])}
+
+        return normalized
+
     def execute(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
-        if name not in self._tools:
-            logger.error(f"Unknown tool requested: {name}")
-            return {"ok": False, "error": f"unknown tool: {name}"}
+        requested_name = str(name or "").strip()
+        canonical_name = self._canonical_tool_name(requested_name)
+        if canonical_name not in self._tools:
+            logger.error(f"Unknown tool requested: {requested_name}")
+            return {"ok": False, "error": f"unknown tool: {requested_name}"}
+
+        if canonical_name != requested_name:
+            logger.info(
+                f"Aliasing tool name '{requested_name}' -> '{canonical_name}'"
+            )
 
         args = args or {}
-        logger.debug(f"Executing tool: {name} with args: {args}")
-        return self.safe_tool_call(name=name, args=args)
+        normalized_args = self._normalize_tool_args(canonical_name, args)
+        logger.debug(f"Executing tool: {canonical_name} with args: {normalized_args}")
+        result = self.safe_tool_call(name=canonical_name, args=normalized_args)
+        result.setdefault("name", canonical_name)
+        if canonical_name != requested_name:
+            result.setdefault("requested_name", requested_name)
+            result.setdefault("aliased", True)
+        if normalized_args != args:
+            result.setdefault("normalized_args", normalized_args)
+        return result
 
     @staticmethod
     def _normalize_tool_result(result: Any) -> dict[str, Any]:
@@ -207,6 +285,28 @@ class ToolSystem:
             source=source,
         )
 
+    def find_strategies(self, query: str, limit: int = 5) -> dict[str, Any]:
+        matches = self.memory_store.find_strategies(query=query, limit=limit)
+        return {"ok": True, "query": query, "matches": matches}
+
+    def record_strategy(
+        self,
+        goal: str,
+        strategy: list[dict[str, Any]],
+        success: bool,
+        source: str = "runtime",
+        notes: str = "",
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.memory_store.record_strategy(
+            goal=goal,
+            strategy=strategy,
+            success=success,
+            source=source,
+            notes=notes,
+            context=context,
+        )
+
     def create_block(
         self,
         name: str,
@@ -252,6 +352,10 @@ class ToolSystem:
         tool_name: str = "",
         tool_args: dict[str, Any] | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
+        skill: str = "",
+        inputs: list[str] | None = None,
+        steps_template: list[dict[str, Any]] | None = None,
+        match_conditions: list[str] | None = None,
     ) -> dict[str, Any]:
         return self.function_registry.create_skill(
             name=name,
@@ -261,6 +365,10 @@ class ToolSystem:
             tool_name=tool_name,
             tool_args=tool_args,
             tool_calls=tool_calls,
+            skill=skill,
+            inputs=inputs,
+            steps_template=steps_template,
+            match_conditions=match_conditions,
         )
 
     def list_skills(self, limit: int = 50, query: str = "", min_score: float = 0.0) -> dict[str, Any]:
@@ -432,6 +540,7 @@ class ToolSystem:
             level=level,
         )
         results = search.get("results", [])
+        meta = search.get("meta", {}) if isinstance(search, dict) else {}
         saved_block: dict[str, Any] | None = None
 
         if results:
@@ -454,6 +563,16 @@ class ToolSystem:
                 )
             except Exception as e:  # pragma: no cover
                 saved_block = {"ok": False, "error": f"failed to save web block: {e}"}
+
+        had_search_error = bool(meta.get("had_search_error", False))
+        if had_search_error and not results:
+            engine = str(meta.get("engine", "search")).strip() or "search"
+            return {
+                "ok": False,
+                "error": f"{engine} search failed or returned no results",
+                "search": search,
+                "saved_block": saved_block,
+            }
 
         return {"ok": True, "search": search, "saved_block": saved_block}
 

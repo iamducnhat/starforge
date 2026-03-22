@@ -994,15 +994,7 @@ class WorkspaceTools:
         stdout = str(result.get("stdout", ""))
         stderr = str(result.get("stderr", ""))
         text = f"{stdout}\n{stderr}"
-
-        failed = 0
-        passed = 0
-        m_failed = re.search(r"(\d+)\s+failed", text, flags=re.IGNORECASE)
-        if m_failed:
-            failed = int(m_failed.group(1))
-        m_passed = re.search(r"(\d+)\s+passed", text, flags=re.IGNORECASE)
-        if m_passed:
-            passed = int(m_passed.group(1))
+        parsed = self._parse_test_output(text)
 
         return {
             "ok": bool(result.get("ok", False)),
@@ -1011,11 +1003,112 @@ class WorkspaceTools:
             "path": self._to_workspace_rel(base),
             "exit_code": result.get("exit_code"),
             "duration_ms": result.get("duration_ms"),
-            "passed": passed,
-            "failed": failed,
+            "passed": int(parsed.get("passed", 0) or 0),
+            "failed": int(parsed.get("failed", 0) or 0),
+            "errors": int(parsed.get("errors", 0) or 0),
+            "skipped": int(parsed.get("skipped", 0) or 0),
+            "test_failures": parsed.get("test_failures", []),
+            "tests_passed": bool(
+                result.get("ok", False)
+                and int(parsed.get("failed", 0) or 0) == 0
+                and int(parsed.get("errors", 0) or 0) == 0
+            ),
             "stdout": stdout,
             "stderr": stderr,
             "raw": result,
+        }
+
+    @staticmethod
+    def _parse_test_output(text: str, max_failures: int = 5) -> dict[str, Any]:
+        failed = 0
+        passed = 0
+        errors = 0
+        skipped = 0
+        failed_counts = re.findall(r"(?<!\S)(\d+)\s+failed\b", text, flags=re.IGNORECASE)
+        passed_counts = re.findall(r"(?<!\S)(\d+)\s+passed\b", text, flags=re.IGNORECASE)
+        error_counts = re.findall(r"(?<!\S)(\d+)\s+errors?\b", text, flags=re.IGNORECASE)
+        skipped_counts = re.findall(r"(?<!\S)(\d+)\s+skipped\b", text, flags=re.IGNORECASE)
+        if failed_counts:
+            failed = int(failed_counts[-1])
+        if passed_counts:
+            passed = int(passed_counts[-1])
+        if error_counts:
+            errors = int(error_counts[-1])
+        if skipped_counts:
+            skipped = int(skipped_counts[-1])
+
+        failures: list[dict[str, str]] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("FAILED "):
+                continue
+            body = line[len("FAILED ") :].strip()
+            nodeid = body
+            message = ""
+            if " - " in body:
+                nodeid, message = body.split(" - ", 1)
+            failures.append(
+                {
+                    "nodeid": nodeid.strip(),
+                    "message": message.strip()[:240],
+                    "summary": line[:320],
+                }
+            )
+            if len(failures) >= max(1, max_failures):
+                break
+
+        if not failures:
+            # Fallback for runners that don't emit pytest-style FAILED lines.
+            excerpt_lines: list[str] = []
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                lowered = line.lower()
+                if any(token in lowered for token in ("assert", "traceback", "error", "exception")):
+                    excerpt_lines.append(line[:240])
+                if len(excerpt_lines) >= max(1, max_failures):
+                    break
+            failures = [
+                {"nodeid": "", "message": line, "summary": line}
+                for line in excerpt_lines
+            ]
+
+        return {
+            "passed": passed,
+            "failed": failed,
+            "errors": errors,
+            "skipped": skipped,
+            "test_failures": failures,
+        }
+
+    @staticmethod
+    def _diff_stats(diff_text: str) -> dict[str, Any]:
+        files: set[str] = set()
+        additions = 0
+        deletions = 0
+        hunks = 0
+        for line in diff_text.splitlines():
+            if line.startswith("@@"):
+                hunks += 1
+                continue
+            if line.startswith("+++ b/") or line.startswith("--- a/"):
+                candidate = line[6:].strip()
+                if candidate and candidate != "/dev/null":
+                    files.add(candidate)
+                continue
+            if line.startswith("+") and not line.startswith("+++"):
+                additions += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                deletions += 1
+
+        return {
+            "changed_file_count": len(files),
+            "changed_files": sorted(files)[:200],
+            "additions": additions,
+            "deletions": deletions,
+            "hunks": hunks,
+            "has_diff": bool(files or additions or deletions),
         }
 
     def get_git_diff(
@@ -1052,19 +1145,26 @@ class WorkspaceTools:
             timeout=timeout,
         )
         diff_text = str(diff_data.get("diff", ""))
-        changed_files = set()
-        for line in diff_text.splitlines():
-            if line.startswith("+++ b/") or line.startswith("--- a/"):
-                fp = line[6:].strip()
-                if fp and fp != "/dev/null":
-                    changed_files.add(fp)
+        diff_stats = self._diff_stats(diff_text)
         return {
             "ok": bool(test_data.get("ok", False)),
             "path": path,
-            "changed_file_count": len(changed_files),
-            "changed_files": sorted(changed_files)[:200],
+            "changed_file_count": int(diff_stats.get("changed_file_count", 0) or 0),
+            "changed_files": diff_stats.get("changed_files", []),
+            "diff_stats": diff_stats,
             "tests": test_data,
             "diff_excerpt": diff_text[:4000],
+            "validation_signals": {
+                "tests_passed": bool(test_data.get("tests_passed", False)),
+                "test_exit_code": test_data.get("exit_code"),
+                "failed_tests": int(test_data.get("failed", 0) or 0),
+                "test_errors": int(test_data.get("errors", 0) or 0),
+                "test_failures": test_data.get("test_failures", []),
+                "has_diff": bool(diff_stats.get("has_diff", False)),
+                "changed_file_count": int(diff_stats.get("changed_file_count", 0) or 0),
+                "diff_additions": int(diff_stats.get("additions", 0) or 0),
+                "diff_deletions": int(diff_stats.get("deletions", 0) or 0),
+            },
         }
 
     def _plan_path(self, plan_id: str) -> Path:

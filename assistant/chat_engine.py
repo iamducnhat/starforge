@@ -16,7 +16,7 @@ from .cli_format import (StreamRenderer, extract_answer_text,
 from .model import BaseModel
 from .tool_calls import parse_tool_calls
 from .tools import ToolSystem
-from .utils import get_env_bool, get_env_int, parse_json_payload
+from .utils import get_env_bool, get_env_float, get_env_int, parse_json_payload
 
 
 @dataclass
@@ -43,6 +43,22 @@ class TaskState:
     current_step: int = 0
     completed_step_ids: set[int] = field(default_factory=set)
     history: list[dict[str, Any]] = field(default_factory=list)
+    dependency_order: list[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.refresh_dependency_order()
+
+    def refresh_dependency_order(self) -> None:
+        ordered = [step.step_id for step in self.steps if step.step_id > 0]
+        self.dependency_order = ordered
+        if not self.steps:
+            self.current_step = 0
+            return
+        if self.current_step < 0 or self.current_step >= len(self.steps):
+            self.current_step = 0
+
+    def step_map(self) -> dict[int, PlanStep]:
+        return {step.step_id: step for step in self.steps}
 
     def current_step_text(self) -> str:
         if not self.steps:
@@ -50,25 +66,40 @@ class TaskState:
         idx = max(0, min(self.current_step, len(self.steps) - 1))
         return self.steps[idx].short_label()
 
+    def runnable_step_ids(self) -> list[int]:
+        step_map = self.step_map()
+        runnable: list[int] = []
+        for step_id in self.dependency_order:
+            step = step_map.get(step_id)
+            if (
+                step is None
+                or step_id in self.completed_step_ids
+                or step.status != "pending"
+            ):
+                continue
+            if all(dep in self.completed_step_ids for dep in step.depends_on):
+                runnable.append(step_id)
+        return runnable
+
     def next_runnable_index(self) -> int | None:
         if not self.steps:
             return None
-        # Prefer the current pointer if it is runnable.
-        if 0 <= self.current_step < len(self.steps):
-            step = self.steps[self.current_step]
-            if step.status == "pending" and all(
-                dep in self.completed_step_ids for dep in step.depends_on
-            ):
-                return self.current_step
-        for idx, step in enumerate(self.steps):
-            if step.status != "pending":
-                continue
-            if all(dep in self.completed_step_ids for dep in step.depends_on):
-                return idx
+        for step_id in self.runnable_step_ids():
+            for idx, step in enumerate(self.steps):
+                if step.step_id == step_id:
+                    return idx
         return None
 
     def remaining_steps(self) -> int:
         return sum(1 for s in self.steps if s.status == "pending")
+
+
+@dataclass
+class RepairState:
+    attempts: int = 0
+    hypotheses: list[dict[str, Any]] = field(default_factory=list)
+    tried_fixes: list[str] = field(default_factory=list)
+    tried_hypotheses: list[str] = field(default_factory=list)
 
 
 class ChatEngine:
@@ -98,6 +129,7 @@ class ChatEngine:
         self.history: list[dict[str, str]] = []
         self.supervision_log = Path("memory/tool_supervision.jsonl")
         self.tool_finetune_log = Path("memory/tool_finetune_samples.jsonl")
+        self.interaction_log = Path("memory/interaction_trajectories.jsonl")
         self.session_dir = Path("memory/sessions")
         self._session_name: str = datetime.now(timezone.utc).strftime(
             "session_%Y%m%d_%H%M%S"
@@ -112,6 +144,24 @@ class ChatEngine:
         self.auto_stop_enabled = False
         self.tool_reflection_enabled = get_env_bool("ASSISTANT_TOOL_REFLECTION", True)
         self.autonomous_plan_step_cap = get_env_int("ASSISTANT_PLAN_STEP_CAP", 8)
+        self.execution_validation_threshold = max(
+            0.0, min(get_env_float("ASSISTANT_EXEC_VALIDATION_THRESHOLD", 0.55), 1.0)
+        )
+        self.autonomous_skill_learning_enabled = get_env_bool(
+            "ASSISTANT_AUTO_LEARN_SKILLS", True
+        )
+        self.autonomous_validate_changes = get_env_bool(
+            "ASSISTANT_AUTO_VALIDATE_CHANGES", True
+        )
+        self.autonomous_test_repair_attempts = max(
+            0, min(get_env_int("ASSISTANT_AUTO_TEST_REPAIR_ATTEMPTS", 3), 5)
+        )
+        self.autonomous_token_budget = max(
+            0, get_env_int("ASSISTANT_AUTO_TOKEN_BUDGET", 0)
+        )
+        self.interaction_logging_enabled = get_env_bool(
+            "ASSISTANT_LOG_INTERACTIONS", True
+        )
         # Set to a callable (e.g. cli_format.print_phase) to display internal
         # phase labels in the CLI.  Left as None in server mode to stay silent.
         self.on_status: Callable[[str], None] | None = None
@@ -438,6 +488,8 @@ class ChatEngine:
                 "content": (
                     "You CAN use tools in this runtime.\n"
                     "If reliable external info is needed, return JSON tool call now.\n"
+                    "Use canonical tool names only (search_web/read_web/scrape_web). "
+                    "Do not use google_search or web_search.\n"
                     "Format only:\n"
                     '{"tool":"name","args":{...}} or {"tool_calls":[...]}\n'
                     "If no tool is needed, return {}.\n"
@@ -483,6 +535,188 @@ class ChatEngine:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception:
             pass
+
+    @staticmethod
+    def _canonical_tool_call_json(tool_calls: list[dict[str, Any]]) -> str:
+        payload_calls: list[dict[str, Any]] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("name", "") or call.get("tool", "")).strip()
+            args = call.get("args", {})
+            if not name:
+                continue
+            if not isinstance(args, dict):
+                args = {}
+            payload_calls.append({"tool": name, "args": args})
+        return json.dumps({"tool_calls": payload_calls}, ensure_ascii=False)
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int = 800) -> str:
+        raw = str(text or "").strip()
+        if len(raw) <= limit:
+            return raw
+        return raw[: max(0, limit - 3)] + "..."
+
+    def _serialize_plan_steps(self, steps: list[PlanStep] | None) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for step in steps or []:
+            if not isinstance(step, PlanStep):
+                continue
+            out.append(
+                {
+                    "step_id": step.step_id,
+                    "action": step.action,
+                    "args": step.args,
+                    "depends_on": step.depends_on,
+                    "expected_output": step.expected_output,
+                    "status": step.status,
+                }
+            )
+        return out
+
+    def _tool_trace_from_payloads(
+        self, payloads: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        trace: list[dict[str, Any]] = []
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            result = payload.get("result", {})
+            reflection = payload.get("reflection", {})
+            row = {
+                "tool": str(payload.get("tool", "")).strip(),
+                "args": payload.get("args", {}) if isinstance(payload.get("args", {}), dict) else {},
+                "ok": bool(isinstance(result, dict) and result.get("ok", False)),
+                "error": self._truncate_text(
+                    str(result.get("error", "")) if isinstance(result, dict) else "",
+                    240,
+                ),
+                "exit_code": result.get("exit_code") if isinstance(result, dict) else None,
+                "tests_passed": bool(result.get("tests_passed", False))
+                if isinstance(result, dict)
+                else False,
+                "passed": int(result.get("passed", 0) or 0)
+                if isinstance(result, dict)
+                else 0,
+                "failed": int(result.get("failed", 0) or 0)
+                if isinstance(result, dict)
+                else 0,
+                "retried": bool(
+                    isinstance(reflection, dict) and reflection.get("retried", False)
+                ),
+                "confidence": (
+                    float(reflection.get("confidence", 0.0) or 0.0)
+                    if isinstance(reflection, dict)
+                    else 0.0
+                ),
+            }
+            if isinstance(result, dict):
+                stdout = str(result.get("stdout", "")).strip()
+                stderr = str(result.get("stderr", "")).strip()
+                if stdout:
+                    row["stdout_excerpt"] = self._truncate_text(stdout, 240)
+                if stderr:
+                    row["stderr_excerpt"] = self._truncate_text(stderr, 240)
+            trace.append(row)
+        return trace
+
+    @staticmethod
+    def _estimate_interaction_quality(
+        final_text: str,
+        tool_payloads: list[dict[str, Any]],
+        *,
+        success_hint: bool | None = None,
+        score_hint: float | None = None,
+    ) -> tuple[bool, float, int, int]:
+        retry_count = 0
+        error_count = 0
+        ok_tools = 0
+        for payload in tool_payloads:
+            result = payload.get("result", {})
+            reflection = payload.get("reflection", {})
+            if isinstance(reflection, dict) and reflection.get("retried", False):
+                retry_count += 1
+            if isinstance(result, dict) and result.get("ok", False):
+                ok_tools += 1
+            else:
+                error_count += 1
+
+        if score_hint is not None:
+            score = max(0.0, min(float(score_hint), 1.0))
+        else:
+            total_tools = len(tool_payloads)
+            score = 0.2 if final_text.strip() else 0.05
+            if total_tools:
+                score += 0.45 * (ok_tools / max(1, total_tools))
+            else:
+                score += 0.25
+            if retry_count == 0:
+                score += 0.1
+            if error_count == 0:
+                score += 0.15
+            lower = final_text.lower()
+            if any(marker in lower for marker in ("error", "failed", "traceback", "exception")):
+                score -= 0.2
+            score = max(0.0, min(score, 1.0))
+
+        success = bool(success_hint) if success_hint is not None else score >= 0.67
+        return success, round(score, 3), retry_count, error_count
+
+    def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _log_interaction_trajectory(
+        self,
+        *,
+        source: str,
+        goal: str,
+        prompt: str,
+        final_text: str,
+        tool_payloads: list[dict[str, Any]],
+        plan: list[PlanStep] | None = None,
+        assistant_action: str = "",
+        success_hint: bool | None = None,
+        score_hint: float | None = None,
+        validator: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.interaction_logging_enabled:
+            return
+        success, score, retry_count, error_count = self._estimate_interaction_quality(
+            final_text,
+            tool_payloads,
+            success_hint=success_hint,
+            score_hint=score_hint,
+        )
+        payload = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source": str(source or "chat_turn"),
+            "goal": str(goal or "").strip(),
+            "prompt": str(prompt or "").strip(),
+            "plan": self._serialize_plan_steps(plan),
+            "tool_calls": self._tool_trace_from_payloads(tool_payloads),
+            "assistant_action": str(assistant_action or "").strip(),
+            "assistant_final": str(final_text or "").strip(),
+            "result": str(final_text or "").strip(),
+            "success": success,
+            "score": score,
+            "retry_count": retry_count,
+            "error_count": error_count,
+        }
+        if isinstance(validator, dict) and validator:
+            payload["validator"] = validator
+        if isinstance(metrics, dict) and metrics:
+            payload["metrics"] = metrics
+        if isinstance(extra, dict) and extra:
+            payload["extra"] = extra
+        self._append_jsonl(self.interaction_log, payload)
 
     @staticmethod
     def _fallback_plan_steps(fallback_goal: str) -> list[PlanStep]:
@@ -539,7 +773,7 @@ class ChatEngine:
                 seen_ids.add(step.step_id)
                 continue
 
-            raw_step_id = item.get("step_id", idx)
+            raw_step_id = item.get("step_id", item.get("id", idx))
             try:
                 step_id = int(raw_step_id)
             except Exception:
@@ -548,7 +782,14 @@ class ChatEngine:
                 step_id = idx if idx not in seen_ids else max(seen_ids or {0}) + 1
             seen_ids.add(step_id)
 
-            action = str(item.get("action", "") or item.get("step", "")).strip()
+            step_type = str(item.get("type", "")).strip().lower()
+            action = str(
+                item.get("action", "")
+                or item.get("tool", "")
+                or item.get("step", "")
+            ).strip()
+            if step_type in {"tool_call", "tool"} and not action:
+                action = str(item.get("tool", "")).strip()
             if not action:
                 action = f"step_{step_id}"
 
@@ -566,7 +807,9 @@ class ChatEngine:
                         continue
                     if di > 0 and di != step_id and di not in deps:
                         deps.append(di)
-            expected_output = str(item.get("expected_output", "")).strip()
+            expected_output = str(
+                item.get("expected_output", "") or item.get("expected", "")
+            ).strip()
 
             out.append(
                 PlanStep(
@@ -587,33 +830,183 @@ class ChatEngine:
         if not steps:
             return ChatEngine._fallback_plan_steps(fallback_goal)
 
-        ids = {s.step_id for s in steps}
         normalized: list[PlanStep] = []
-        for idx, s in enumerate(sorted(steps, key=lambda x: x.step_id), start=1):
-            step_id = int(s.step_id) if int(s.step_id) > 0 else idx
-            if step_id in {x.step_id for x in normalized}:
-                step_id = idx
-            deps = [d for d in s.depends_on if d in ids and d != step_id]
+        used_ids: set[int] = set()
+        for idx, step in enumerate(steps, start=1):
+            try:
+                raw_step_id = int(step.step_id)
+            except Exception:
+                raw_step_id = idx
+            step_id = raw_step_id if raw_step_id > 0 else idx
+            if step_id in used_ids:
+                step_id = max(used_ids or {0}) + 1
+            used_ids.add(step_id)
             normalized.append(
                 PlanStep(
                     step_id=step_id,
-                    action=s.action.strip() or f"step_{idx}",
-                    args=s.args if isinstance(s.args, dict) else {},
-                    depends_on=deps,
-                    expected_output=s.expected_output.strip(),
-                    status=s.status if s.status in {"pending", "in_progress", "done"} else "pending",
+                    action=step.action.strip() or f"step_{idx}",
+                    args=step.args if isinstance(step.args, dict) else {},
+                    depends_on=[],
+                    expected_output=step.expected_output.strip(),
+                    status=(
+                        step.status
+                        if step.status in {"pending", "in_progress", "done"}
+                        else "pending"
+                    ),
                 )
             )
 
-        # Break cycles/invalid ordering by forcing dependencies to prior step ids.
-        seen: set[int] = set()
-        for s in normalized:
-            s.depends_on = [d for d in s.depends_on if d in seen]
-            seen.add(s.step_id)
+        valid_ids = {step.step_id for step in normalized}
+        incoming: dict[int, list[int]] = {step.step_id: [] for step in normalized}
+        originals = {step.step_id: idx for idx, step in enumerate(normalized)}
+        for idx, step in enumerate(steps, start=1):
+            normalized_step = normalized[idx - 1]
+            deps: list[int] = []
+            for dep in step.depends_on:
+                try:
+                    dep_id = int(dep)
+                except Exception:
+                    continue
+                if dep_id <= 0 or dep_id == normalized_step.step_id:
+                    continue
+                if dep_id not in valid_ids or dep_id in deps:
+                    continue
+                deps.append(dep_id)
+            incoming[normalized_step.step_id] = deps
+            normalized_step.depends_on = deps
 
-        if not normalized:
+        ordered = ChatEngine._topological_sort_plan_steps(
+            normalized, incoming=incoming, original_positions=originals
+        )
+        if not ordered:
             return ChatEngine._fallback_plan_steps(fallback_goal)
-        return normalized
+        return ordered
+
+    @staticmethod
+    def _topological_sort_plan_steps(
+        steps: list[PlanStep],
+        *,
+        incoming: dict[int, list[int]] | None = None,
+        original_positions: dict[int, int] | None = None,
+    ) -> list[PlanStep]:
+        if not steps:
+            return []
+
+        step_map = {step.step_id: step for step in steps}
+        original_positions = original_positions or {
+            step.step_id: idx for idx, step in enumerate(steps)
+        }
+        deps_map: dict[int, list[int]] = {}
+        for step in steps:
+            deps = incoming.get(step.step_id, list(step.depends_on)) if incoming else list(step.depends_on)
+            deps_map[step.step_id] = [dep for dep in deps if dep in step_map and dep != step.step_id]
+
+        outgoing: dict[int, list[int]] = {step.step_id: [] for step in steps}
+        indegree: dict[int, int] = {step.step_id: 0 for step in steps}
+        for step_id, deps in deps_map.items():
+            indegree[step_id] = len(deps)
+            for dep in deps:
+                outgoing.setdefault(dep, []).append(step_id)
+
+        ready = sorted(
+            [step_id for step_id, degree in indegree.items() if degree == 0],
+            key=lambda step_id: (
+                original_positions.get(step_id, 0),
+                step_id,
+            ),
+        )
+        ordered_ids: list[int] = []
+        while ready:
+            current = ready.pop(0)
+            ordered_ids.append(current)
+            for child in sorted(
+                outgoing.get(current, []),
+                key=lambda step_id: (
+                    original_positions.get(step_id, 0),
+                    step_id,
+                ),
+            ):
+                indegree[child] = max(0, indegree.get(child, 0) - 1)
+                if indegree[child] == 0 and child not in ordered_ids and child not in ready:
+                    ready.append(child)
+            ready.sort(
+                key=lambda step_id: (
+                    original_positions.get(step_id, 0),
+                    step_id,
+                )
+            )
+
+        if len(ordered_ids) != len(steps):
+            scheduled = set(ordered_ids)
+            remaining = sorted(
+                [step_id for step_id in step_map if step_id not in scheduled],
+                key=lambda step_id: (
+                    original_positions.get(step_id, 0),
+                    step_id,
+                ),
+            )
+            for step_id in remaining:
+                deps_map[step_id] = [dep for dep in deps_map.get(step_id, []) if dep in scheduled]
+                ordered_ids.append(step_id)
+                scheduled.add(step_id)
+
+        ordered_steps: list[PlanStep] = []
+        scheduled: set[int] = set()
+        for step_id in ordered_ids:
+            source = step_map[step_id]
+            deps = [dep for dep in deps_map.get(step_id, []) if dep in scheduled]
+            ordered_steps.append(
+                PlanStep(
+                    step_id=source.step_id,
+                    action=source.action,
+                    args=source.args,
+                    depends_on=deps,
+                    expected_output=source.expected_output,
+                    status=source.status,
+                )
+            )
+            scheduled.add(step_id)
+        return ordered_steps
+
+    @staticmethod
+    def _token_overlap_similarity(a: str, b: str) -> float:
+        def _tokens(text: str) -> set[str]:
+            return {t for t in re.findall(r"[a-zA-Z0-9_]{3,}", text.lower())}
+
+        ta = _tokens(a)
+        tb = _tokens(b)
+        if not ta or not tb:
+            return 0.0
+        return len(ta & tb) / max(1.0, len(ta | tb))
+
+    @staticmethod
+    def _infer_strategy_context_from_objective(objective: str) -> dict[str, Any]:
+        text = str(objective or "").lower()
+        context: dict[str, Any] = {}
+        if "pytest" in text or "test" in text:
+            context["test_runner"] = "pytest"
+            context["framework"] = "pytest"
+        if "node" in text or "npm" in text or "jest" in text:
+            context["language"] = "node"
+        elif "python" in text or "pip" in text:
+            context["language"] = "python"
+        return context
+
+    @staticmethod
+    def _strategy_context_match_score(
+        expected: dict[str, Any], runtime: dict[str, Any]
+    ) -> float:
+        if not expected:
+            return 0.15
+        total = 0
+        matched = 0
+        for key, value in expected.items():
+            total += 1
+            if str(runtime.get(key, "")).strip().lower() == str(value).strip().lower():
+                matched += 1
+        if total <= 0:
+            return 0.15
+        return matched / total
 
     def _plan_objective_steps(
         self, objective: str, step_cap: int | None = None
@@ -624,22 +1017,30 @@ class ChatEngine:
             if step_cap is not None
             else max(3, min(self.autonomous_plan_step_cap, 20))
         )
+        runtime_context = self._infer_strategy_context_from_objective(objective)
+        reused = self._reuse_strategy_steps(
+            objective, step_cap=cap, runtime_context=runtime_context
+        )
+        if reused:
+            return reused[:cap]
         planning_prompt = (
             "Break this objective into actionable execution steps with strict structure.\n"
             f"Objective: {objective}\n"
-            "Return strict JSON only in this shape:\n"
+            "Return strict JSON only. Preferred shape:\n"
             "{\n"
             '  "steps":[\n'
             "    {\n"
-            '      "step_id": 1,\n'
-            '      "action": "search_project",\n'
+            '      "id": 1,\n'
+            '      "type": "tool_call",\n'
+            '      "tool": "search_project",\n'
             '      "args": {"query":"..."},\n'
             '      "depends_on": [],\n'
-            '      "expected_output": "what this step should produce"\n'
+            '      "expected": "what this step should produce"\n'
             "    }\n"
             "  ]\n"
             "}\n"
-            f"Rules: 1..{cap} steps, unique step_id, depends_on references earlier step ids only."
+            "Compatibility aliases accepted: step_id<->id, action<->tool, expected_output<->expected.\n"
+            f"Rules: 1..{cap} steps, unique ids, depends_on references earlier step ids only."
         )
         try:
             raw = self.model.generate(
@@ -666,6 +1067,110 @@ class ChatEngine:
             current_step=0,
             completed_step_ids=set(),
             history=[],
+        )
+
+    def _strategy_memory_store(self) -> Any | None:
+        return getattr(self.tools, "memory_store", None)
+
+    def _reuse_strategy_steps(
+        self,
+        objective: str,
+        step_cap: int | None = None,
+        runtime_context: dict[str, Any] | None = None,
+    ) -> list[PlanStep]:
+        store = self._strategy_memory_store()
+        if store is None or not hasattr(store, "find_strategies"):
+            return []
+        try:
+            matches = store.find_strategies(query=objective, limit=5)
+        except Exception:
+            return []
+        if not isinstance(matches, list) or not matches:
+            return []
+        ctx = runtime_context if isinstance(runtime_context, dict) else {}
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for match in matches:
+            goal_similarity = self._token_overlap_similarity(
+                objective, str(match.get("goal", ""))
+            )
+            context_score = self._strategy_context_match_score(
+                match.get("context", {}) if isinstance(match.get("context"), dict) else {},
+                ctx,
+            )
+            success_rate = float(match.get("success_rate", 0.0) or 0.0)
+            base_score = float(match.get("score", 0.0) or 0.0)
+            hybrid_score = (
+                (base_score * 0.6)
+                + (goal_similarity * 0.35)
+                + (context_score * 0.2)
+                + (success_rate * 0.25)
+            )
+            ranked.append((hybrid_score, match))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        top_score, top = ranked[0]
+        if top_score < 0.7:
+            return []
+        steps = self._validate_plan_steps(
+            self._coerce_structured_plan(top.get("strategy", []), fallback_goal=objective),
+            fallback_goal=objective,
+        )
+        if step_cap is not None:
+            steps = steps[: max(1, step_cap)]
+        return steps
+
+    def _record_strategy_outcome(
+        self,
+        objective: str,
+        steps: list[PlanStep],
+        success: bool,
+        notes: str = "",
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        store = self._strategy_memory_store()
+        if store is None or not hasattr(store, "record_strategy"):
+            return
+        serialized = [
+            {
+                "step_id": step.step_id,
+                "action": step.action,
+                "args": step.args,
+                "depends_on": step.depends_on,
+                "expected_output": step.expected_output,
+            }
+            for step in steps
+        ]
+        try:
+            store.record_strategy(
+                goal=objective,
+                strategy=serialized,
+                success=success,
+                source="autonomous",
+                notes=notes[:400],
+                context=context if isinstance(context, dict) else None,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _print_auto_metrics(auto_metrics: dict[str, Any]) -> None:
+        steps = max(1, int(auto_metrics.get("steps", 0) or 0))
+        failed_tools = int(auto_metrics.get("failed_tool_calls", 0) or 0)
+        tool_calls = int(auto_metrics.get("tool_calls", 0) or 0)
+        step_successes = int(auto_metrics.get("step_successes", 0) or 0)
+        step_retries = int(auto_metrics.get("retries", 0) or 0)
+        replans = int(auto_metrics.get("replans", 0) or 0)
+        validator_failures = int(auto_metrics.get("validator_failures", 0) or 0)
+        test_repairs = int(auto_metrics.get("test_repair_attempts", 0) or 0)
+        success_rate = round(step_successes / steps, 3)
+        tool_failure_rate = round(failed_tools / max(1, tool_calls), 3)
+        print(
+            "[auto] metrics: "
+            f"steps={steps}, tools={tool_calls}, failed_tools={failed_tools}, "
+            f"tool_failure_rate={tool_failure_rate}, success_rate={success_rate}, "
+            f"retries={step_retries}, replans={replans}, "
+            f"test_repairs={test_repairs}, "
+            f"validator_failures={validator_failures}, "
+            f"est_tokens_out~{int(auto_metrics.get('est_tokens_out', 0) or 0)}"
         )
 
     def _reflect_tool_result(
@@ -781,14 +1286,23 @@ class ChatEngine:
 
         if reflection.get("retry"):
             retry_call = reflection.get("revised_call")
+            suggested_name = ""
+            suggested_args = initial_args
             if isinstance(retry_call, dict):
-                retry_name = str(retry_call.get("name", "")).strip() or initial_name
-                retry_args = retry_call.get("args", {})
-                if not isinstance(retry_args, dict):
-                    retry_args = initial_args
-            else:
-                retry_name = initial_name
+                suggested_name = str(retry_call.get("name", "")).strip()
+                suggested_args = retry_call.get("args", {})
+                if not isinstance(suggested_args, dict):
+                    suggested_args = initial_args
+            retry_args = suggested_args
+            # Keep retries on the same tool to avoid confusing start/result mismatches
+            # and prevent reflection from jumping to hallucinated tool names.
+            if suggested_name and suggested_name != initial_name:
+                reflection["retry_name_ignored"] = suggested_name
+                # If the reflected call switches tools, ignore its args as well.
+                # Mixing list_files args into read_file (or vice versa) causes
+                # path-type errors like "not a file"/"not a directory".
                 retry_args = initial_args
+            retry_name = initial_name
             retry_result = self._execute_tool_call_with_policy(
                 user_message, {"name": retry_name, "args": retry_args}
             )
@@ -1261,6 +1775,8 @@ class ChatEngine:
 
     def _requires_web_presearch_for_factual(self, user_message: str) -> bool:
         flags = self._intent_flags(user_message)
+        if flags.get("workspace_edit", False):
+            return False
         return bool(flags.get("factual", False))
 
     @staticmethod
@@ -1290,6 +1806,15 @@ class ChatEngine:
         tool_calls: list[dict[str, Any]],
         datetime_executed: bool,
     ) -> list[dict[str, Any]]:
+        factual_tools = {
+            "get_current_datetime",
+            "find_in_memory",
+            "search_memory",
+            "search_web",
+        }
+        # Respect explicit model tool selection for this turn.
+        if any(str(call.get("name", "")) not in factual_tools for call in tool_calls):
+            return tool_calls
         if not self._requires_web_presearch_for_factual(user_message):
             return tool_calls
         if datetime_executed:
@@ -1365,20 +1890,47 @@ class ChatEngine:
 
     @staticmethod
     def _extract_explicit_file_paths(text: str, limit: int = 3) -> list[str]:
-        # Capture lightweight file-like mentions such as src/app.py or README.md
-        pattern = re.compile(r"([A-Za-z0-9_\-./]+\.[A-Za-z0-9_]{1,8})")
+        # Capture lightweight path mentions such as src/app.py, README.md, or
+        # workspaces/crypto_research so preinspection can inspect the right kind of path.
+        patterns = (
+            re.compile(r"([A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)+/?)"),
+            re.compile(r"([A-Za-z0-9_.-]+\.[A-Za-z0-9_]{1,8})"),
+        )
         out: list[str] = []
         seen = set()
-        for match in pattern.findall(text):
-            candidate = match.strip().strip(".,;:()[]{}\"'")
-            if not candidate or "/" in candidate and candidate.startswith("http"):
-                continue
-            if candidate not in seen:
-                out.append(candidate)
-                seen.add(candidate)
-            if len(out) >= limit:
-                break
+        for pattern in patterns:
+            for match in pattern.findall(text):
+                candidate = str(match).strip().strip(".,;:()[]{}\"'")
+                if not candidate or candidate.startswith(("http://", "https://")):
+                    continue
+                if candidate.endswith("/") and candidate != "/":
+                    candidate = candidate.rstrip("/")
+                if candidate not in seen:
+                    out.append(candidate)
+                    seen.add(candidate)
+                if len(out) >= limit:
+                    return out
         return out
+
+    def _preinspect_call_for_explicit_path(self, path: str) -> dict[str, Any]:
+        workspace_tools = getattr(self.tools, "workspace_tools", None)
+        if workspace_tools is None:
+            return {"name": "read_file", "args": {"path": path, "max_chars": 6000}}
+
+        try:
+            resolved = workspace_tools._resolve(path)
+        except Exception:
+            resolved = None
+
+        if resolved is not None and resolved.exists():
+            if resolved.is_dir():
+                return {"name": "list_files", "args": {"path": path, "max_entries": 100}}
+            if resolved.is_file():
+                return {"name": "read_file", "args": {"path": path, "max_chars": 6000}}
+
+        if "." not in Path(path).name:
+            return {"name": "list_files", "args": {"path": path, "max_entries": 100}}
+        return {"name": "read_file", "args": {"path": path, "max_chars": 6000}}
 
     @staticmethod
     def _extract_symbol_hints(text: str, limit: int = 3) -> list[str]:
@@ -1434,7 +1986,7 @@ class ChatEngine:
                 }
             )
         for p in self._extract_explicit_file_paths(user_message):
-            calls.append({"name": "read_file", "args": {"path": p, "max_chars": 6000}})
+            calls.append(self._preinspect_call_for_explicit_path(p))
         return calls
 
     def _ensure_web_call_for_factual(
@@ -1443,6 +1995,15 @@ class ChatEngine:
         tool_calls: list[dict[str, Any]],
         web_search_executed: bool,
     ) -> list[dict[str, Any]]:
+        factual_tools = {
+            "get_current_datetime",
+            "find_in_memory",
+            "search_memory",
+            "search_web",
+        }
+        # Respect explicit model tool selection for this turn.
+        if any(str(call.get("name", "")) not in factual_tools for call in tool_calls):
+            return tool_calls
         if web_search_executed or not self._requires_web_presearch_for_factual(
             user_message
         ):
@@ -1458,6 +2019,35 @@ class ChatEngine:
                 },
             }
         ]
+
+    def _ensure_memory_call_for_factual(
+        self,
+        user_message: str,
+        tool_calls: list[dict[str, Any]],
+        memory_checked: bool,
+    ) -> list[dict[str, Any]]:
+        factual_tools = {
+            "get_current_datetime",
+            "find_in_memory",
+            "search_memory",
+            "search_web",
+        }
+        # Respect explicit model tool selection for this turn.
+        if any(str(call.get("name", "")) not in factual_tools for call in tool_calls):
+            return tool_calls
+        if memory_checked or not self._requires_web_presearch_for_factual(user_message):
+            return tool_calls
+        if any(
+            call.get("name") in {"find_in_memory", "search_memory"} for call in tool_calls
+        ):
+            return tool_calls
+        mem_call = {
+            "name": "find_in_memory",
+            "args": {"keywords": self._extract_keywords(user_message)},
+        }
+        if tool_calls and tool_calls[0].get("name") == "get_current_datetime":
+            return [tool_calls[0], mem_call] + tool_calls[1:]
+        return [mem_call] + tool_calls
 
     def _emergency_tool_calls(self, user_message: str) -> list[dict[str, Any]]:
         keywords = self._extract_keywords(user_message)
@@ -1687,6 +2277,7 @@ class ChatEngine:
         on_chunk: Optional[Callable[[str], None]] = None,
         on_tool_start: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         enforce_presearch: bool = True,
+        log_interaction: bool = True,
     ) -> str:
         # Keep a single orchestration path by delegating to streaming engine.
         # We still expose the optional on_chunk callback for CLI/debug consumers.
@@ -1704,6 +2295,7 @@ class ChatEngine:
             on_tool_start=on_tool_start,
             on_tool_phase=None,
             enforce_presearch=enforce_presearch,
+            log_interaction=log_interaction,
         )
 
     def handle_turn_stream(
@@ -1716,6 +2308,7 @@ class ChatEngine:
         on_tool_start: Callable[[str, dict[str, object]], None] | None = None,
         on_tool_phase: Callable[[], None] | None = None,
         enforce_presearch: bool = True,
+        log_interaction: bool = True,
     ) -> str:
         self.history.append({"role": "user", "content": user_message})
         continue_after_tools = False
@@ -1723,6 +2316,9 @@ class ChatEngine:
         tools_executed_this_turn = False
         web_search_executed_this_turn = False
         datetime_executed_this_turn = False
+        memory_checked_this_turn = False
+        turn_tool_payloads: list[dict[str, Any]] = []
+        assistant_action_text = ""
 
         for _ in range(self.max_tool_rounds):
             assistant_text = ""
@@ -1778,6 +2374,11 @@ class ChatEngine:
                     user_message=user_message,
                     tool_calls=tool_calls,
                     datetime_executed=datetime_executed_this_turn,
+                )
+                tool_calls = self._ensure_memory_call_for_factual(
+                    user_message=user_message,
+                    tool_calls=tool_calls,
+                    memory_checked=memory_checked_this_turn,
                 )
                 tool_calls = self._ensure_web_call_for_factual(
                     user_message=user_message,
@@ -1885,12 +2486,22 @@ class ChatEngine:
                         if pending_nonthink:
                             on_chunk(pending_nonthink)
                         self.history.append({"role": "assistant", "content": clean})
+                        if log_interaction:
+                            self._log_interaction_trajectory(
+                                source="chat_turn",
+                                goal=user_message,
+                                prompt=user_message,
+                                final_text=clean,
+                                tool_payloads=turn_tool_payloads,
+                                assistant_action=assistant_action_text,
+                            )
                         return assistant_text
 
             self.history.append({"role": "assistant", "content": assistant_text})
             self.history[-1]["content"] = self._strip_thinking(
                 self.history[-1]["content"]
             )
+            assistant_action_text = self._canonical_tool_call_json(tool_calls)
             self._log_tool_training_sample(
                 user_message=user_message,
                 assistant_text=assistant_text,
@@ -1900,14 +2511,41 @@ class ChatEngine:
                 on_tool_phase()
 
             for call in tool_calls:
+                start_name = str(call.get("name", ""))
+                start_args = call.get("args", {})
+                if not isinstance(start_args, dict):
+                    start_args = {}
+                start_args = dict(start_args)
                 if on_tool_start:
-                    on_tool_start(call["name"], call.get("args", {}))
-                executed = self._run_tool_call_with_reflection(user_message, call)
+                    try:
+                        on_tool_start(start_name, start_args)
+                    except Exception:
+                        pass
+                try:
+                    executed = self._run_tool_call_with_reflection(user_message, call)
+                except Exception as e:
+                    executed = {
+                        "name": start_name,
+                        "args": start_args,
+                        "result": {"ok": False, "error": f"tool execution crashed: {e}"},
+                        "reflection": {"status": "failed", "reason": "exception"},
+                        "initial_name": start_name,
+                        "initial_args": start_args,
+                    }
                 result = executed.get("result", {})
                 tool_name = str(executed.get("name", call.get("name", "")))
                 tool_args = executed.get("args", call.get("args", {}))
+                display_name = str(executed.get("initial_name", start_name))
+                display_args = executed.get("initial_args", start_args)
+                if not isinstance(display_args, dict):
+                    display_args = start_args
+                else:
+                    display_args = dict(display_args)
                 if on_tool:
-                    on_tool(tool_name, tool_args, result)
+                    try:
+                        on_tool(display_name, display_args, result)
+                    except Exception:
+                        pass
                 if (
                     tool_name == "search_web"
                     and isinstance(result, dict)
@@ -1920,9 +2558,15 @@ class ChatEngine:
                     and result.get("ok", False)
                 ):
                     datetime_executed_this_turn = True
+                if tool_name in {"find_in_memory", "search_memory"} and isinstance(
+                    result, dict
+                ):
+                    memory_checked_this_turn = True
                 tool_payload = {
                     "tool": tool_name,
                     "args": tool_args,
+                    "display_tool": display_name,
+                    "display_args": display_args,
                     "initial_tool": executed.get("initial_name", call.get("name", "")),
                     "initial_args": executed.get("initial_args", call.get("args", {})),
                     "reflection": executed.get("reflection", {}),
@@ -1934,6 +2578,7 @@ class ChatEngine:
                         "content": json.dumps(tool_payload, ensure_ascii=False),
                     }
                 )
+                turn_tool_payloads.append(tool_payload)
             tools_executed_this_turn = True
             continue_after_tools = True
 
@@ -1942,6 +2587,15 @@ class ChatEngine:
             or "Tool-call loop limit reached. Return direct answer."
         )
         self.history.append({"role": "assistant", "content": final_text})
+        if log_interaction:
+            self._log_interaction_trajectory(
+                source="chat_turn",
+                goal=user_message,
+                prompt=user_message,
+                final_text=final_text,
+                tool_payloads=turn_tool_payloads,
+                assistant_action=assistant_action_text,
+            )
         return final_text
 
     def run_cli(self) -> None:
@@ -2303,6 +2957,33 @@ class ChatEngine:
         print("[auto] plan:")
         for idx, step in enumerate(state.steps, start=1):
             print(f"  {idx}. {step.short_label()}")
+        learned_signatures: set[str] = set()
+        auto_metrics = {
+            "tool_calls": 0,
+            "failed_tool_calls": 0,
+            "est_tokens_out": 0,
+            "steps": 0,
+            "step_successes": 0,
+            "retries": 0,
+            "replans": 0,
+            "validator_failures": 0,
+            "test_repair_attempts": 0,
+        }
+        print_tool_start("detect_project_context", {"path": ".", "include_runtime": True})
+        project_context_result = self.tools.execute(
+            "detect_project_context", {"path": ".", "include_runtime": True}
+        )
+        print_tool_event(
+            "detect_project_context",
+            {"path": ".", "include_runtime": True},
+            project_context_result,
+        )
+        project_context: dict[str, Any] = {}
+        if isinstance(project_context_result, dict) and project_context_result.get("ok", False):
+            project_context = project_context_result
+            framework = str(project_context.get("framework", "")).strip() or "unknown"
+            runner = str(project_context.get("test_runner", "")).strip() or "unknown"
+            print(f"[auto] context: framework={framework}, test_runner={runner}")
 
         repeated_signature_count = 0
         last_signature = ""
@@ -2316,6 +2997,14 @@ class ChatEngine:
                 if next_idx is None:
                     if finite_steps:
                         print("[auto] done: planned steps completed")
+                        self._record_strategy_outcome(
+                            objective,
+                            state.steps,
+                            success=True,
+                            notes="planned steps completed",
+                            context=project_context,
+                        )
+                        self._print_auto_metrics(auto_metrics)
                         return
                     state = self._create_task_state(objective, step_cap=None)
                     print("[auto] regenerated plan:")
@@ -2324,6 +3013,7 @@ class ChatEngine:
                     next_idx = state.next_runnable_index()
                     if next_idx is None:
                         print("[auto] stopped: no runnable steps after replan")
+                        self._print_auto_metrics(auto_metrics)
                         return
                 state.current_step = next_idx
 
@@ -2341,6 +3031,14 @@ class ChatEngine:
                     )
                 current_step = state.steps[state.current_step]
                 current_step.status = "in_progress"
+                context_line = ""
+                if project_context:
+                    context_line = (
+                        "Detected project context: "
+                        f"framework={project_context.get('framework', 'unknown')}, "
+                        f"test_runner={project_context.get('test_runner', 'auto')}, "
+                        f"entry_points={project_context.get('entry_points', [])[:3]}\n"
+                    )
                 prompt = (
                     "Autonomous mode enabled.\n"
                     f"Objective: {objective}\n"
@@ -2348,12 +3046,13 @@ class ChatEngine:
                     "Planned task list:\n"
                     + "\n".join(plan_lines)
                     + "\n"
-                    f"Current plan step ({state.current_step + 1}/{len(state.steps)}): {current_step.short_label()}\n"
-                    f"Current step args: {json.dumps(current_step.args, ensure_ascii=False)}\n"
-                    "Execute this current plan step now. Use tools as needed and stay in workspace root only.\n"
-                    "After execution, include a short status sentence.\n"
-                    "If finished, output a final line that starts with: AUTONOMOUS_DONE\n"
-                    "If no useful next action remains, output a final line that starts with: AUTONOMOUS_BORED"
+                    + context_line
+                    + f"Current plan step ({state.current_step + 1}/{len(state.steps)}): {current_step.short_label()}\n"
+                    + f"Current step args: {json.dumps(current_step.args, ensure_ascii=False)}\n"
+                    + "Execute this current plan step now. Use tools as needed and stay in workspace root only.\n"
+                    + "After execution, include a short status sentence.\n"
+                    + "If finished, output a final line that starts with: AUTONOMOUS_DONE\n"
+                    + "If no useful next action remains, output a final line that starts with: AUTONOMOUS_BORED"
                 )
 
                 print(f"\n[auto step {i}/{steps_text}]")
@@ -2365,12 +3064,25 @@ class ChatEngine:
                     print_tool_start,
                     renderer.prepare_tool_output,
                     enforce_presearch=False,
+                    log_interaction=False,
                 )
                 renderer.finish()
                 # Save after every step so messages are on disk before the next
                 # step's _messages() call can compact them away.
                 self._flush_to_session_log()
                 final_text = extract_answer_text(response).strip()
+                auto_metrics["steps"] += 1
+                auto_metrics["est_tokens_out"] += max(1, len(response) // 4)
+                tool_payloads = self._recent_tool_payloads(limit=8)
+                auto_metrics["tool_calls"] += len(tool_payloads)
+                auto_metrics["failed_tool_calls"] += sum(
+                    1
+                    for p in tool_payloads
+                    if not (
+                        isinstance(p.get("result"), dict)
+                        and p.get("result", {}).get("ok", False)
+                    )
+                )
                 tool_signature = self._autonomous_tool_signature()
                 if tool_signature and tool_signature == last_signature:
                     repeated_signature_count += 1
@@ -2385,15 +3097,8 @@ class ChatEngine:
                     last_text = final_text
 
                 lower_text = final_text.lower()
-                # Check model-signalled completion FIRST, before any error patterns,
-                # so a response that contains "402" or other substrings but also
-                # signals DONE/BORED is not misclassified as an error.
-                if re.search(r"(?mi)^\s*AUTONOMOUS_DONE\b", final_text):
-                    print("[auto] done")
-                    return
-                if re.search(r"(?mi)^\s*AUTONOMOUS_BORED\b", final_text):
-                    print("[auto] stopped by model (bored/no useful next action)")
-                    return
+                model_done = bool(re.search(r"(?mi)^\s*AUTONOMOUS_DONE\b", final_text))
+                model_bored = bool(re.search(r"(?mi)^\s*AUTONOMOUS_BORED\b", final_text))
                 if "429" in final_text or "too many requests" in lower_text:
                     wait = min(120, 15 * (2**rate_limit_count))
                     print(
@@ -2409,12 +3114,60 @@ class ChatEngine:
                     or "openrouter unavailable" in lower_text
                 ):
                     print("[auto] stopped: model backend unavailable")
+                    self._print_auto_metrics(auto_metrics)
                     return
                 if "payment required" in lower_text or "402" in final_text:
                     print(
                         "[auto] stopped: model requires payment (402). Add credits or set OPENROUTER_FALLBACK_MODEL to a free model."
                     )
+                    self._print_auto_metrics(auto_metrics)
                     return
+
+                workspace_validation = self._maybe_validate_workspace_after_step(
+                    step=current_step,
+                    project_context=project_context,
+                    payloads=tool_payloads,
+                )
+                repair_text, repaired_payloads, repaired_validation, repair_history = (
+                    self._maybe_run_test_driven_repair(
+                        objective=objective,
+                        step=current_step,
+                        workspace_validation=workspace_validation,
+                        current_tool_payloads=tool_payloads,
+                        project_context=project_context,
+                        auto_metrics=auto_metrics,
+                    )
+                )
+                if repair_text:
+                    final_text = repair_text
+                    tool_payloads = repaired_payloads
+                    workspace_validation = repaired_validation
+                else:
+                    repair_history = []
+                validation = self._validate_autonomous_step_execution(
+                    step=current_step,
+                    final_text=final_text,
+                    tool_payloads=tool_payloads,
+                    workspace_validation=workspace_validation,
+                )
+                validation_score = float(validation.get("score", 0.0) or 0.0)
+                if validation_score >= 0.67:
+                    validation_status = "success"
+                elif validation_score >= 0.4:
+                    validation_status = "partial"
+                else:
+                    validation_status = "failed"
+                validation["score"] = round(validation_score, 3)
+                validation["status"] = validation_status
+                if validation_status == "success":
+                    auto_metrics["step_successes"] += 1
+                else:
+                    auto_metrics["validator_failures"] += 1
+                print(
+                    "[auto] validator: "
+                    f"status={validation_status}, score={validation['score']}, "
+                    f"tools_ok={validation.get('ok_tools', 0)}/{validation.get('total_tools', 0)}"
+                )
 
                 progress = self._reflect_autonomous_progress(
                     state=state,
@@ -2427,6 +3180,27 @@ class ChatEngine:
                 issues = progress.get("issues", [])
                 if not isinstance(issues, list):
                     issues = []
+                validation_issues = validation.get("issues", [])
+                if isinstance(validation_issues, list):
+                    issues.extend(validation_issues[:3])
+                if model_done and action not in {"retry", "replan"}:
+                    action = "done"
+                if model_bored and action not in {"retry", "replan"}:
+                    action = "bored"
+                if validation_score < self.execution_validation_threshold and action in {
+                    "advance",
+                    "done",
+                }:
+                    action = "retry" if validation_status == "partial" else "replan"
+                    validator_reason = (
+                        f"validator gate: status={validation_status}, score={validation_score:.2f} "
+                        f"(threshold={self.execution_validation_threshold:.2f})"
+                    )
+                    reason = (
+                        f"{reason} | {validator_reason}".strip(" |")
+                        if reason
+                        else validator_reason
+                    )
                 state.history.append(
                     {
                         "loop_step": i,
@@ -2436,18 +3210,69 @@ class ChatEngine:
                         "reason": reason,
                         "confidence": round(confidence, 3),
                         "issues": issues[:5],
+                        "validator": validation,
+                        "model_done_hint": model_done,
+                        "model_bored_hint": model_bored,
                         "tool_signature": tool_signature,
                         "final_text": final_text[:1200],
+                        "metrics": dict(auto_metrics),
                     }
+                )
+                self._log_interaction_trajectory(
+                    source="autonomous_step",
+                    goal=objective,
+                    prompt=prompt,
+                    final_text=final_text,
+                    tool_payloads=tool_payloads,
+                    plan=state.steps,
+                    assistant_action="",
+                    success_hint=validation_status == "success",
+                    score_hint=validation_score,
+                    validator=validation,
+                    metrics=dict(auto_metrics),
+                    extra={
+                        "current_step": current_step.short_label(),
+                        "decision": action,
+                        "reason": reason,
+                        "repair_history": repair_history,
+                    },
                 )
 
                 if action == "done":
+                    current_step.status = "done"
+                    state.completed_step_ids.add(current_step.step_id)
+                    learned = self._maybe_learn_skill_from_step(
+                        objective=objective,
+                        step=current_step,
+                        payloads=tool_payloads,
+                        validation=validation,
+                        learned_signatures=learned_signatures,
+                    )
+                    if isinstance(learned, dict) and learned.get("ok", False):
+                        print(f"[auto] learned skill: {learned.get('name')}")
+                    self._record_strategy_outcome(
+                        objective,
+                        state.steps,
+                        success=True,
+                        notes=reason or "autonomous objective completed",
+                        context=project_context,
+                    )
                     print("[auto] done")
+                    self._print_auto_metrics(auto_metrics)
                     return
                 if action == "bored":
+                    self._record_strategy_outcome(
+                        objective,
+                        state.steps,
+                        success=False,
+                        notes=reason or "reflection reported no useful next action",
+                        context=project_context,
+                    )
                     print("[auto] stopped by reflection (no useful next action)")
+                    self._print_auto_metrics(auto_metrics)
                     return
                 if action == "replan":
+                    auto_metrics["replans"] += 1
                     new_steps = progress.get("new_steps", [])
                     if isinstance(new_steps, list) and new_steps:
                         state.steps = self._validate_plan_steps(
@@ -2456,6 +3281,7 @@ class ChatEngine:
                         )
                     else:
                         state.steps = self._plan_objective_steps(objective, step_cap=plan_cap)
+                    state.refresh_dependency_order()
                     state.current_step = 0
                     state.completed_step_ids = set()
                     if reason:
@@ -2463,6 +3289,7 @@ class ChatEngine:
                     else:
                         print("[auto] replanned")
                 elif action == "retry":
+                    auto_metrics["retries"] += 1
                     current_step.status = "pending"
                     if finite_steps:
                         i -= 1
@@ -2474,39 +3301,1029 @@ class ChatEngine:
                 else:
                     current_step.status = "done"
                     state.completed_step_ids.add(current_step.step_id)
+                    learned = self._maybe_learn_skill_from_step(
+                        objective=objective,
+                        step=current_step,
+                        payloads=tool_payloads,
+                        validation=validation,
+                        learned_signatures=learned_signatures,
+                    )
                     if reason:
                         print(f"[auto] advance: {reason}")
                     if issues:
                         print(f"[auto] issues: {', '.join(str(x) for x in issues[:3])}")
+                    if isinstance(learned, dict) and learned.get("ok", False):
+                        print(f"[auto] learned skill: {learned.get('name')}")
 
+                if (
+                    self.autonomous_token_budget > 0
+                    and auto_metrics["est_tokens_out"] >= self.autonomous_token_budget
+                ):
+                    print(
+                        "[auto] stopped: token budget reached "
+                        f"({auto_metrics['est_tokens_out']}/{self.autonomous_token_budget})"
+                    )
+                    self._print_auto_metrics(auto_metrics)
+                    return
                 if self.auto_stop_enabled and repeated_signature_count >= 5:
                     print("[auto] stopped: repeated tool loop detected")
+                    self._print_auto_metrics(auto_metrics)
                     return
                 if self.auto_stop_enabled and stale_count >= 5:
                     print("[auto] stopped: repeated unchanged output")
+                    self._print_auto_metrics(auto_metrics)
                     return
         except KeyboardInterrupt:
             print("\n[auto] interrupted (^C)")
+            self._print_auto_metrics(auto_metrics)
             return
 
-    def _autonomous_tool_signature(self) -> str:
-        parts: list[str] = []
+    def _recent_tool_payloads(self, limit: int = 8) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
         for msg in reversed(self.history):
             if msg.get("role") != "tool":
-                if parts:
+                if payloads:
                     break
                 continue
             try:
                 payload = json.loads(msg.get("content", ""))
             except Exception:
                 continue
+            if isinstance(payload, dict):
+                payloads.append(payload)
+            if len(payloads) >= max(1, limit):
+                break
+        payloads.reverse()
+        return payloads
+
+    def _autonomous_tool_signature(self) -> str:
+        parts: list[str] = []
+        for payload in self._recent_tool_payloads(limit=3):
             name = str(payload.get("tool", "")).strip()
             args = payload.get("args", {})
             if not name:
                 continue
-            parts.append(
-                f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
-            )
-            if len(parts) >= 3:
-                break
+            parts.append(f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}")
         return "|".join(sorted(parts))
+
+    def _collect_validation_signals(
+        self,
+        step: PlanStep,
+        tool_payloads: list[dict[str, Any]],
+        workspace_validation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        signals = {
+            "tool_successes": 0,
+            "tool_failures": 0,
+            "command_exit_codes": [],
+            "test_runs": [],
+            "diff_observed": False,
+            "changed_file_count": 0,
+            "workspace_validation_ok": None,
+        }
+        for payload in tool_payloads:
+            result = payload.get("result", {})
+            tool_name = str(payload.get("tool", "")).strip()
+            if isinstance(result, dict) and result.get("ok", False):
+                signals["tool_successes"] += 1
+            else:
+                signals["tool_failures"] += 1
+
+            if tool_name == "execute_command" and isinstance(result, dict):
+                exit_code = result.get("exit_code")
+                if isinstance(exit_code, int):
+                    signals["command_exit_codes"].append(exit_code)
+
+            if tool_name == "run_tests" and isinstance(result, dict):
+                signals["test_runs"].append(
+                    {
+                        "ok": bool(result.get("ok", False)),
+                        "exit_code": result.get("exit_code"),
+                        "failed": int(result.get("failed", 0) or 0),
+                        "errors": int(result.get("errors", 0) or 0),
+                        "passed": int(result.get("passed", 0) or 0),
+                    }
+                )
+
+            if tool_name == "get_git_diff" and isinstance(result, dict):
+                diff_text = str(result.get("diff", ""))
+                if diff_text.strip():
+                    signals["diff_observed"] = True
+                    signals["changed_file_count"] = max(
+                        int(signals["changed_file_count"] or 0),
+                        diff_text.count("\n+++ b/"),
+                    )
+
+        if isinstance(workspace_validation, dict):
+            signals["workspace_validation_ok"] = bool(
+                workspace_validation.get("ok", False)
+            )
+            validation_signals = workspace_validation.get("validation_signals", {})
+            if isinstance(validation_signals, dict):
+                signals["diff_observed"] = bool(
+                    signals["diff_observed"] or validation_signals.get("has_diff", False)
+                )
+                signals["changed_file_count"] = max(
+                    int(signals["changed_file_count"] or 0),
+                    int(validation_signals.get("changed_file_count", 0) or 0),
+                )
+                exit_code = validation_signals.get("test_exit_code")
+                if isinstance(exit_code, int):
+                    signals["command_exit_codes"].append(exit_code)
+                signals["test_runs"].append(
+                    {
+                        "ok": bool(validation_signals.get("tests_passed", False)),
+                        "exit_code": exit_code,
+                        "failed": int(validation_signals.get("failed_tests", 0) or 0),
+                        "errors": int(validation_signals.get("test_errors", 0) or 0),
+                        "passed": int(
+                            workspace_validation.get("tests", {}).get("passed", 0) or 0
+                        )
+                        if isinstance(workspace_validation.get("tests"), dict)
+                        else 0,
+                    }
+                )
+
+        action = step.action.lower()
+        signals["expects_workspace_change"] = any(
+            marker in action
+            for marker in ("edit", "write", "fix", "implement", "refactor", "create")
+        ) or self._should_run_validation_tests(step, tool_payloads)
+        return signals
+
+    def _validate_autonomous_step_execution(
+        self,
+        step: PlanStep,
+        final_text: str,
+        tool_payloads: list[dict[str, Any]],
+        workspace_validation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        issues: list[str] = []
+        signals = self._collect_validation_signals(
+            step=step,
+            tool_payloads=tool_payloads,
+            workspace_validation=workspace_validation,
+        )
+        total_tools = len(tool_payloads)
+        ok_tools = int(signals.get("tool_successes", 0) or 0)
+
+        expected_basis = f"{step.action} {step.expected_output}".strip()
+        expected_terms = self._extract_keywords(expected_basis, limit=6)
+        evidence_parts = [final_text.lower()]
+        for payload in tool_payloads[:6]:
+            result = payload.get("result", {})
+            try:
+                evidence_parts.append(
+                    json.dumps(result, ensure_ascii=False)[:600].lower()
+                )
+            except Exception:
+                evidence_parts.append(str(result).lower()[:600])
+        evidence_text = "\n".join(evidence_parts)
+        expected_matches = sum(1 for t in expected_terms if t and t.lower() in evidence_text)
+        expected_ratio = (
+            expected_matches / len(expected_terms)
+            if expected_terms
+            else 0.0
+        )
+
+        score = 0.0
+        if total_tools > 0:
+            score += 0.15
+            score += 0.15 * (ok_tools / max(1, total_tools))
+        else:
+            issues.append("no tool evidence for current step")
+
+        test_runs = signals.get("test_runs", [])
+        if isinstance(test_runs, list) and test_runs:
+            successful_runs = 0
+            for run in test_runs:
+                if not isinstance(run, dict):
+                    continue
+                exit_code = run.get("exit_code")
+                failed = int(run.get("failed", 0) or 0)
+                errors = int(run.get("errors", 0) or 0)
+                run_ok = bool(run.get("ok", False)) and failed == 0 and errors == 0
+                if run_ok:
+                    successful_runs += 1
+                else:
+                    issues.append(
+                        f"tests failed (exit_code={exit_code}, failed={failed}, errors={errors})"
+                    )
+            score += 0.35 * (successful_runs / max(1, len(test_runs)))
+        elif signals.get("expects_workspace_change", False):
+            issues.append("no test or validation evidence captured for code-changing step")
+
+        exit_codes = [
+            int(code)
+            for code in signals.get("command_exit_codes", [])
+            if isinstance(code, int)
+        ]
+        non_zero_exit_codes = [code for code in exit_codes if code != 0]
+        if non_zero_exit_codes:
+            issues.append(
+                "non-zero exit codes observed: "
+                + ", ".join(str(code) for code in non_zero_exit_codes[:3])
+            )
+        else:
+            if exit_codes:
+                score += 0.15
+
+        if signals.get("expects_workspace_change", False):
+            if signals.get("diff_observed", False) or int(
+                signals.get("changed_file_count", 0) or 0
+            ) > 0:
+                score += 0.15
+            else:
+                issues.append("expected workspace diff was not observed")
+
+        workspace_ok = signals.get("workspace_validation_ok")
+        if workspace_ok is True:
+            score += 0.1
+        elif workspace_ok is False:
+            issues.append("workspace validation failed")
+
+        failure_markers = (
+            "error",
+            "failed",
+            "exception",
+            "traceback",
+            "invalid",
+            "unknown tool",
+        )
+        if final_text.strip() and not any(m in final_text.lower() for m in failure_markers):
+            score += 0.1
+        else:
+            issues.append("assistant output indicates unresolved failure")
+
+        score += 0.1 * expected_ratio
+        if expected_terms and expected_matches == 0:
+            issues.append("expected output terms missing from evidence")
+
+        score = max(0.0, min(score, 1.0))
+        if score >= 0.67:
+            status = "success"
+        elif score >= 0.4:
+            status = "partial"
+        else:
+            status = "failed"
+
+        return {
+            "status": status,
+            "score": round(score, 3),
+            "issues": issues[:5],
+            "ok_tools": ok_tools,
+            "total_tools": total_tools,
+            "expected_matches": expected_matches,
+            "expected_terms": expected_terms,
+            "signals": signals,
+        }
+
+    @staticmethod
+    def _tool_names_from_payloads(payloads: list[dict[str, Any]]) -> list[str]:
+        names: list[str] = []
+        for payload in payloads:
+            name = str(payload.get("tool", "")).strip()
+            if name:
+                names.append(name)
+        return names
+
+    def _should_run_validation_tests(
+        self, step: PlanStep, payloads: list[dict[str, Any]]
+    ) -> bool:
+        edit_markers = {
+            "create_file",
+            "edit_file",
+            "write_file",
+            "delete_file",
+            "execute_command",
+        }
+        tool_names = set(self._tool_names_from_payloads(payloads))
+        action = step.action.lower()
+        return (
+            bool(tool_names.intersection(edit_markers))
+            or "edit" in action
+            or "refactor" in action
+            or "fix" in action
+            or "implement" in action
+        )
+
+    def _maybe_validate_workspace_after_step(
+        self,
+        step: PlanStep,
+        project_context: dict[str, Any],
+        payloads: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not self.autonomous_validate_changes:
+            return None
+        if not self._should_run_validation_tests(step, payloads):
+            return None
+
+        runner = "auto"
+        if isinstance(project_context, dict):
+            detected_runner = str(project_context.get("test_runner", "")).strip()
+            if detected_runner and detected_runner.lower() != "unknown":
+                runner = detected_runner
+
+        args = {"path": ".", "test_runner": runner, "test_args": "", "timeout": 180}
+        print_tool_start("validate_workspace_changes", args)
+        result = self.tools.execute("validate_workspace_changes", args)
+        print_tool_event("validate_workspace_changes", args, result)
+        return result
+
+    @staticmethod
+    def _workspace_validation_signals(
+        workspace_validation: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not isinstance(workspace_validation, dict):
+            return {}
+        signals = workspace_validation.get("validation_signals", {})
+        return signals if isinstance(signals, dict) else {}
+
+    def _should_attempt_test_driven_repair(
+        self,
+        step: PlanStep,
+        workspace_validation: dict[str, Any] | None,
+        attempt_no: int,
+    ) -> bool:
+        if attempt_no >= self.autonomous_test_repair_attempts:
+            return False
+        if not self.autonomous_validate_changes:
+            return False
+        signals = self._workspace_validation_signals(workspace_validation)
+        failed_tests = int(signals.get("failed_tests", 0) or 0)
+        test_errors = int(signals.get("test_errors", 0) or 0)
+        if failed_tests <= 0 and test_errors <= 0:
+            return False
+        action = step.action.lower()
+        return any(
+            marker in action
+            for marker in ("fix", "edit", "write", "implement", "refactor", "patch")
+        ) or self._should_run_validation_tests(step, [])
+
+    @staticmethod
+    def _render_test_failure_context(
+        workspace_validation: dict[str, Any] | None,
+        max_items: int = 4,
+    ) -> str:
+        signals = {}
+        if isinstance(workspace_validation, dict):
+            raw = workspace_validation.get("validation_signals", {})
+            if isinstance(raw, dict):
+                signals = raw
+        failures = signals.get("test_failures", [])
+        lines: list[str] = []
+        if isinstance(failures, list):
+            for item in failures[: max(1, max_items)]:
+                if not isinstance(item, dict):
+                    continue
+                nodeid = str(item.get("nodeid", "")).strip()
+                message = str(item.get("message", "")).strip()
+                summary = str(item.get("summary", "")).strip()
+                if nodeid and message:
+                    lines.append(f"- {nodeid}: {message}")
+                elif summary:
+                    lines.append(f"- {summary}")
+        if not lines and isinstance(workspace_validation, dict):
+            tests = workspace_validation.get("tests", {})
+            if isinstance(tests, dict):
+                stderr = str(tests.get("stderr", "")).strip()
+                stdout = str(tests.get("stdout", "")).strip()
+                excerpt = stderr or stdout
+                if excerpt:
+                    lines.append(f"- {excerpt[:320]}")
+        return "\n".join(lines)
+
+    def _test_failure_snapshot(
+        self, workspace_validation: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        signals = self._workspace_validation_signals(workspace_validation)
+        failures = signals.get("test_failures", [])
+        signature_parts: list[str] = []
+        if isinstance(failures, list):
+            for item in failures[:8]:
+                if not isinstance(item, dict):
+                    continue
+                nodeid = str(item.get("nodeid", "")).strip()
+                message = str(item.get("message", "")).strip()
+                summary = str(item.get("summary", "")).strip()
+                part = nodeid or summary or message
+                if part:
+                    signature_parts.append(part[:180])
+        return {
+            "tests_passed": bool(signals.get("tests_passed", False)),
+            "failed_tests": int(signals.get("failed_tests", 0) or 0),
+            "test_errors": int(signals.get("test_errors", 0) or 0),
+            "signature": "|".join(signature_parts),
+            "summary": self._render_test_failure_context(workspace_validation),
+        }
+
+    @staticmethod
+    def _repair_outcome_label(
+        before: dict[str, Any], after: dict[str, Any]
+    ) -> str:
+        before_total = int(before.get("failed_tests", 0) or 0) + int(
+            before.get("test_errors", 0) or 0
+        )
+        after_total = int(after.get("failed_tests", 0) or 0) + int(
+            after.get("test_errors", 0) or 0
+        )
+        if bool(after.get("tests_passed", False)):
+            return "resolved"
+        if after_total < before_total:
+            return "improved"
+        if after_total > before_total:
+            return "regressed"
+        if str(after.get("signature", "")) != str(before.get("signature", "")):
+            return "changed"
+        return "unchanged"
+
+    @staticmethod
+    def _repair_hypothesis_key(hypothesis: dict[str, Any]) -> str:
+        if not isinstance(hypothesis, dict):
+            return ""
+        core = str(hypothesis.get("hypothesis", "")).strip().lower()
+        files = hypothesis.get("suspected_files", [])
+        if not isinstance(files, list):
+            files = []
+        normalized_files = "|".join(sorted(str(p).strip().lower() for p in files if str(p).strip()))
+        return f"{core}|{normalized_files}".strip("|")
+
+    @staticmethod
+    def _repair_fix_signature(payloads: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            tool = str(payload.get("tool", payload.get("name", ""))).strip().lower()
+            args = payload.get("args", {})
+            if not tool:
+                continue
+            try:
+                args_text = json.dumps(args, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                args_text = str(args)
+            parts.append(f"{tool}:{args_text[:320]}")
+        joined = "|".join(parts)
+        return joined[:1200]
+
+    @staticmethod
+    def _build_root_cause_context(
+        step: PlanStep,
+        project_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        context: dict[str, Any] = {}
+        framework = str(project_context.get("framework", "")).strip().lower()
+        if framework:
+            context["framework"] = framework
+        test_runner = str(project_context.get("test_runner", "")).strip().lower()
+        if test_runner:
+            context["test_runner"] = test_runner
+        action = step.action.lower()
+        if "pytest" in action or "python" in action or framework in {"pytest", "django", "flask"}:
+            context["language"] = "python"
+        elif "node" in action or "npm" in action or framework in {"node", "nextjs", "react"}:
+            context["language"] = "node"
+        return context
+
+    @staticmethod
+    def _extract_root_cause_error_text(workspace_validation: dict[str, Any] | None) -> str:
+        if not isinstance(workspace_validation, dict):
+            return ""
+        lines: list[str] = []
+        signals = workspace_validation.get("validation_signals", {})
+        if isinstance(signals, dict):
+            failures = signals.get("test_failures", [])
+            if isinstance(failures, list):
+                for item in failures[:6]:
+                    if not isinstance(item, dict):
+                        continue
+                    summary = str(item.get("summary", "")).strip()
+                    message = str(item.get("message", "")).strip()
+                    nodeid = str(item.get("nodeid", "")).strip()
+                    if summary:
+                        lines.append(summary)
+                    elif nodeid and message:
+                        lines.append(f"{nodeid}: {message}")
+                    elif message:
+                        lines.append(message)
+        tests = workspace_validation.get("tests", {})
+        if isinstance(tests, dict):
+            stderr = str(tests.get("stderr", "")).strip()
+            stdout = str(tests.get("stdout", "")).strip()
+            if stderr:
+                lines.append(stderr[:900])
+            elif stdout:
+                lines.append(stdout[:600])
+        return "\n".join(line for line in lines if line).strip()[:1800]
+
+    @staticmethod
+    def _normalize_root_cause_fix_call(
+        tool_name: str, args: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]]:
+        name = str(tool_name or "").strip()
+        normalized_args = dict(args or {})
+        if name == "run_terminal":
+            cmd = str(normalized_args.get("cmd", "")).strip()
+            if cmd and "action" not in normalized_args:
+                # One-shot command path is safer and deterministic for template fixes.
+                name = "execute_command"
+                normalized_args = {"cmd": cmd, "path": ".", "timeout": 180}
+        return name, normalized_args
+
+    def _maybe_apply_root_cause_fix(
+        self,
+        step: PlanStep,
+        workspace_validation: dict[str, Any] | None,
+        project_context: dict[str, Any],
+        auto_metrics: dict[str, Any],
+    ) -> tuple[bool, list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
+        store = self._strategy_memory_store()
+        if store is None or not hasattr(store, "find_root_causes"):
+            return False, [], workspace_validation, None
+        error_text = self._extract_root_cause_error_text(workspace_validation)
+        if not error_text:
+            return False, [], workspace_validation, None
+        context = self._build_root_cause_context(step=step, project_context=project_context)
+        try:
+            matches = store.find_root_causes(error_text=error_text, context=context, limit=1)
+        except Exception:
+            return False, [], workspace_validation, None
+        if not isinstance(matches, list) or not matches:
+            return False, [], workspace_validation, None
+        selected = matches[0]
+        fix_template = selected.get("fix_template", [])
+        if not isinstance(fix_template, list) or not fix_template:
+            return False, [], workspace_validation, None
+
+        root_payloads: list[dict[str, Any]] = []
+        all_ok = True
+        for item in fix_template:
+            if not isinstance(item, dict):
+                continue
+            tool_name = str(item.get("tool", "")).strip()
+            args = item.get("args", {})
+            if not tool_name or not isinstance(args, dict):
+                continue
+            tool_name, args = self._normalize_root_cause_fix_call(tool_name, args)
+            result = self.tools.execute(tool_name, args)
+            payload = {"tool": tool_name, "args": args, "result": result, "source": "root_cause"}
+            root_payloads.append(payload)
+            auto_metrics["tool_calls"] = int(auto_metrics.get("tool_calls", 0) or 0) + 1
+            if not (isinstance(result, dict) and result.get("ok", False)):
+                auto_metrics["failed_tool_calls"] = int(
+                    auto_metrics.get("failed_tool_calls", 0) or 0
+                ) + 1
+                all_ok = False
+                break
+
+        updated_validation = self._maybe_validate_workspace_after_step(
+            step=step,
+            project_context=project_context,
+            payloads=root_payloads,
+        )
+        signals = self._workspace_validation_signals(updated_validation)
+        solved = bool(signals.get("tests_passed", False))
+        confidence = float(selected.get("confidence", 0.5) or 0.5)
+        if hasattr(store, "record_root_cause_feedback"):
+            try:
+                store.record_root_cause_feedback(
+                    root_cause_id=str(selected.get("id", "")),
+                    success=bool(all_ok and solved),
+                    confidence=1.0 if solved else max(0.0, confidence * 0.6),
+                )
+            except Exception:
+                pass
+        history_item = {
+            "attempt": 0,
+            "kind": "root_cause",
+            "pattern": str(selected.get("pattern", "")).strip(),
+            "root_cause_id": str(selected.get("id", "")).strip(),
+            "hypothesis": f"root-cause match: {str(selected.get('pattern', '')).strip()}",
+            "confidence": confidence,
+            "result": "success" if solved else "failed",
+            "impact": "resolved" if solved else "no_change",
+            "outcome": "resolved" if solved else "unchanged",
+        }
+        return solved, root_payloads, updated_validation, history_item
+
+    def _propose_test_failure_hypothesis(
+        self,
+        objective: str,
+        step: PlanStep,
+        workspace_validation: dict[str, Any],
+        repair_history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        changed_files = workspace_validation.get("changed_files", [])
+        if not isinstance(changed_files, list):
+            changed_files = []
+        failure_context = self._render_test_failure_context(workspace_validation)
+        history_lines: list[str] = []
+        for item in repair_history[-3:]:
+            if not isinstance(item, dict):
+                continue
+            history_lines.append(
+                f"- Attempt {item.get('attempt', '?')}: "
+                f"{str(item.get('hypothesis', '')).strip()} "
+                f"=> {str(item.get('outcome', '')).strip()}"
+            )
+        history_text = "\n".join(history_lines) or "- none"
+        prompt = (
+            "You are debugging a failing autonomous code-edit step.\n"
+            "Return strict JSON only with keys:\n"
+            "hypothesis (string), suspected_files (array), rationale (string), next_check (string), confidence (0..1).\n"
+            f"Objective: {objective}\n"
+            f"Current step: {step.short_label()}\n"
+            f"Changed files: {changed_files[:10]}\n"
+            f"Current failing tests:\n{failure_context or '- No structured failure summary available'}\n"
+            f"Prior repair attempts:\n{history_text}"
+        )
+        fallback_message = failure_context.splitlines()[0].strip() if failure_context else ""
+        fallback = {
+            "hypothesis": (
+                f"Fix the code path exercised by the current failing test. {fallback_message}".strip()
+            ),
+            "suspected_files": changed_files[:5],
+            "rationale": "Use the parsed failing test summary and the recently changed files as the first debugging anchor.",
+            "next_check": "Inspect the failing test target and the changed implementation before patching.",
+            "confidence": 0.45,
+        }
+        try:
+            raw = self.model.generate(
+                [
+                    {
+                        "role": "system",
+                        "content": "You are a debugging supervisor. Return JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+            )
+            payload = parse_json_payload(self._strip_thinking(raw))
+            if not isinstance(payload, dict):
+                return fallback
+            hypothesis = str(payload.get("hypothesis", "")).strip()
+            rationale = str(payload.get("rationale", "")).strip()
+            next_check = str(payload.get("next_check", "")).strip()
+            suspected_files = payload.get("suspected_files", [])
+            if not isinstance(suspected_files, list):
+                suspected_files = changed_files[:5]
+            normalized_files = [
+                str(item).strip()
+                for item in suspected_files
+                if str(item).strip()
+            ][:6]
+            try:
+                confidence = float(payload.get("confidence", fallback["confidence"]))
+            except Exception:
+                confidence = float(fallback["confidence"])
+            return {
+                "hypothesis": hypothesis or fallback["hypothesis"],
+                "suspected_files": normalized_files or changed_files[:5],
+                "rationale": rationale or fallback["rationale"],
+                "next_check": next_check or fallback["next_check"],
+                "confidence": max(0.0, min(confidence, 1.0)),
+            }
+        except Exception:
+            return fallback
+
+    @staticmethod
+    def _render_repair_history(repair_history: list[dict[str, Any]]) -> str:
+        if not repair_history:
+            return "- none"
+        lines: list[str] = []
+        for item in repair_history[-4:]:
+            if not isinstance(item, dict):
+                continue
+            before_total = int(item.get("before_total", 0) or 0)
+            after_total = int(item.get("after_total", 0) or 0)
+            lines.append(
+                f"- Attempt {item.get('attempt', '?')}: "
+                f"hypothesis={str(item.get('hypothesis', '')).strip()} | "
+                f"outcome={str(item.get('outcome', '')).strip()} | "
+                f"failures {before_total}->{after_total}"
+            )
+        return "\n".join(lines) or "- none"
+
+    def _build_test_repair_prompt(
+        self,
+        objective: str,
+        step: PlanStep,
+        workspace_validation: dict[str, Any],
+        attempt_no: int,
+        hypothesis: dict[str, Any] | None = None,
+        repair_history: list[dict[str, Any]] | None = None,
+    ) -> str:
+        signals = self._workspace_validation_signals(workspace_validation)
+        failed_tests = int(signals.get("failed_tests", 0) or 0)
+        test_errors = int(signals.get("test_errors", 0) or 0)
+        changed_files = workspace_validation.get("changed_files", [])
+        if not isinstance(changed_files, list):
+            changed_files = []
+        failure_context = self._render_test_failure_context(workspace_validation)
+        diff_excerpt = str(workspace_validation.get("diff_excerpt", "")).strip()
+        diff_excerpt = diff_excerpt[:1200] if diff_excerpt else ""
+        hypothesis = hypothesis or {}
+        history_text = self._render_repair_history(repair_history or [])
+        return (
+            "Autonomous repair mode enabled.\n"
+            f"Objective: {objective}\n"
+            f"Current step: {step.short_label()}\n"
+            f"Repair attempt: {attempt_no + 1}/{self.autonomous_test_repair_attempts}\n"
+            "The previous code-editing step left the workspace failing tests.\n"
+            f"Failed tests: {failed_tests}, test errors: {test_errors}\n"
+            f"Changed files: {changed_files[:10]}\n"
+            f"Current debugging hypothesis: {str(hypothesis.get('hypothesis', '')).strip() or 'Investigate the current failing path.'}\n"
+            f"Suspected files: {hypothesis.get('suspected_files', []) if isinstance(hypothesis.get('suspected_files', []), list) else []}\n"
+            f"Why this hypothesis: {str(hypothesis.get('rationale', '')).strip() or 'Use the failing test output as the main signal.'}\n"
+            f"Next check before patching: {str(hypothesis.get('next_check', '')).strip() or 'Read the implicated code and test around the failure.'}\n"
+            "Previous repair attempts:\n"
+            f"{history_text}\n"
+            "Focus only on fixing the concrete failing tests using the workspace state.\n"
+            "Use tools to inspect files, test your hypothesis, patch code, and rerun tests. Avoid unrelated refactors.\n"
+            "Failure summaries:\n"
+            f"{failure_context or '- No structured failure summary available'}\n"
+            + (
+                f"Diff excerpt:\n{diff_excerpt}\n"
+                if diff_excerpt
+                else ""
+            )
+            + "After the fix attempt, include a short status sentence."
+        )
+
+    def _maybe_run_test_driven_repair(
+        self,
+        objective: str,
+        step: PlanStep,
+        workspace_validation: dict[str, Any] | None,
+        current_tool_payloads: list[dict[str, Any]],
+        project_context: dict[str, Any],
+        auto_metrics: dict[str, Any],
+    ) -> tuple[str | None, list[dict[str, Any]], dict[str, Any] | None, list[dict[str, Any]]]:
+        validation = workspace_validation
+        combined_payloads = list(current_tool_payloads)
+        latest_text: str | None = None
+        repair_history: list[dict[str, Any]] = []
+        repair_state = RepairState()
+
+        # Root-cause first-pass: deterministic fix templates before model-driven repair.
+        solved_by_root_cause, root_payloads, validation, root_history = self._maybe_apply_root_cause_fix(
+            step=step,
+            workspace_validation=validation,
+            project_context=project_context,
+            auto_metrics=auto_metrics,
+        )
+        if root_payloads:
+            combined_payloads.extend(root_payloads)
+        if root_history:
+            repair_history.append(root_history)
+        if solved_by_root_cause:
+            latest_text = "Applied root-cause fix template and tests are now passing."
+            return latest_text, combined_payloads, validation, repair_history
+
+        for attempt_no in range(self.autonomous_test_repair_attempts):
+            if not self._should_attempt_test_driven_repair(step, validation, attempt_no):
+                break
+            repair_state.attempts += 1
+            auto_metrics["test_repair_attempts"] = int(
+                auto_metrics.get("test_repair_attempts", 0) or 0
+            ) + 1
+            before_snapshot = self._test_failure_snapshot(validation)
+            hypothesis = self._propose_test_failure_hypothesis(
+                objective=objective,
+                step=step,
+                workspace_validation=validation or {},
+                repair_history=repair_history,
+            )
+            hypothesis_key = self._repair_hypothesis_key(hypothesis)
+            if hypothesis_key and hypothesis_key in repair_state.tried_hypotheses:
+                repair_history.append(
+                    {
+                        "attempt": attempt_no + 1,
+                        "hypothesis": str(hypothesis.get("hypothesis", "")).strip(),
+                        "confidence": float(hypothesis.get("confidence", 0.0) or 0.0),
+                        "result": "failed",
+                        "impact": "no change",
+                        "outcome": "unchanged",
+                        "before_total": int(before_snapshot.get("failed_tests", 0) or 0)
+                        + int(before_snapshot.get("test_errors", 0) or 0),
+                        "after_total": int(before_snapshot.get("failed_tests", 0) or 0)
+                        + int(before_snapshot.get("test_errors", 0) or 0),
+                        "skipped": "duplicate_hypothesis",
+                    }
+                )
+                continue
+            if hypothesis_key:
+                repair_state.tried_hypotheses.append(hypothesis_key)
+            repair_state.hypotheses.append(hypothesis)
+            repair_prompt = self._build_test_repair_prompt(
+                objective=objective,
+                step=step,
+                workspace_validation=validation or {},
+                attempt_no=attempt_no,
+                hypothesis=hypothesis,
+                repair_history=repair_history,
+            )
+            print(f"[auto] test-driven repair attempt {attempt_no + 1}")
+            renderer = StreamRenderer()
+            response = self.handle_turn_stream(
+                repair_prompt,
+                renderer.feed,
+                print_tool_event,
+                print_tool_start,
+                renderer.prepare_tool_output,
+                enforce_presearch=False,
+                log_interaction=False,
+            )
+            renderer.finish()
+            latest_text = extract_answer_text(response).strip()
+            repair_payloads = self._recent_tool_payloads(limit=8)
+            combined_payloads.extend(repair_payloads)
+            auto_metrics["est_tokens_out"] += max(1, len(response) // 4)
+            auto_metrics["tool_calls"] += len(repair_payloads)
+            auto_metrics["failed_tool_calls"] += sum(
+                1
+                for p in repair_payloads
+                if not (
+                    isinstance(p.get("result"), dict)
+                    and p.get("result", {}).get("ok", False)
+                )
+            )
+            fix_signature = self._repair_fix_signature(repair_payloads)
+            duplicate_fix = bool(fix_signature) and fix_signature in repair_state.tried_fixes
+            if fix_signature:
+                repair_state.tried_fixes.append(fix_signature)
+            validation = self._maybe_validate_workspace_after_step(
+                step=step,
+                project_context=project_context,
+                payloads=repair_payloads,
+            )
+            after_snapshot = self._test_failure_snapshot(validation)
+            outcome = self._repair_outcome_label(before_snapshot, after_snapshot)
+            result_label = (
+                "success"
+                if bool(after_snapshot.get("tests_passed", False))
+                else "failed"
+            )
+            impact_label = (
+                "resolved"
+                if outcome == "resolved"
+                else "improved"
+                if outcome == "improved"
+                else "regressed"
+                if outcome == "regressed"
+                else "no change"
+            )
+            repair_history.append(
+                {
+                    "attempt": attempt_no + 1,
+                    "hypothesis": str(hypothesis.get("hypothesis", "")).strip(),
+                    "suspected_files": hypothesis.get("suspected_files", []),
+                    "confidence": float(hypothesis.get("confidence", 0.0) or 0.0),
+                    "result": result_label,
+                    "impact": impact_label,
+                    "before_total": int(before_snapshot.get("failed_tests", 0) or 0)
+                    + int(before_snapshot.get("test_errors", 0) or 0),
+                    "after_total": int(after_snapshot.get("failed_tests", 0) or 0)
+                    + int(after_snapshot.get("test_errors", 0) or 0),
+                    "outcome": outcome,
+                    "duplicate_fix": duplicate_fix,
+                }
+            )
+            signals = self._workspace_validation_signals(validation)
+            if bool(signals.get("tests_passed", False)):
+                break
+        return latest_text, combined_payloads, validation, repair_history
+
+    @staticmethod
+    def _infer_skill_input_name(
+        key: str, value: Any, seen: set[str]
+    ) -> str | None:
+        lowered = key.lower()
+        candidate = ""
+        if "path" in lowered or "file" in lowered:
+            candidate = "file_path"
+        elif "query" in lowered or "pattern" in lowered or "symbol" in lowered:
+            candidate = "query"
+        elif lowered in {"runner", "test_runner"}:
+            candidate = "test_runner"
+        elif lowered in {"cmd", "command"}:
+            candidate = "command"
+        elif isinstance(value, str) and ("/" in value or value.endswith(".py")):
+            candidate = key
+        if not candidate:
+            return None
+        candidate = re.sub(r"[^a-z0-9_]+", "_", candidate.lower()).strip("_")
+        if not candidate:
+            return None
+        if candidate in seen:
+            return candidate
+        seen.add(candidate)
+        return candidate
+
+    def _abstract_skill_template(
+        self, tool_calls: list[dict[str, Any]]
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        inputs: list[str] = []
+        seen_inputs: set[str] = set()
+        templates: list[dict[str, Any]] = []
+        placeholder_by_signature: dict[tuple[str, str], str] = {}
+
+        for call in tool_calls:
+            name = str(call.get("tool", "")).strip()
+            raw_args = call.get("args", {})
+            if not name or not isinstance(raw_args, dict):
+                continue
+            templated_args: dict[str, Any] = {}
+            for key, value in raw_args.items():
+                signature = (name, str(key))
+                placeholder = placeholder_by_signature.get(signature)
+                if placeholder is None:
+                    placeholder = self._infer_skill_input_name(str(key), value, seen_inputs)
+                    if placeholder:
+                        placeholder_by_signature[signature] = placeholder
+                        if placeholder not in inputs:
+                            inputs.append(placeholder)
+                if placeholder and isinstance(value, (str, int, float, bool)):
+                    templated_args[str(key)] = f"${{{placeholder}}}"
+                else:
+                    templated_args[str(key)] = value
+            templates.append({"tool": name, "args": templated_args})
+        return inputs, templates
+
+    def _maybe_learn_skill_from_step(
+        self,
+        objective: str,
+        step: PlanStep,
+        payloads: list[dict[str, Any]],
+        validation: dict[str, Any],
+        learned_signatures: set[str],
+    ) -> dict[str, Any] | None:
+        if not self.autonomous_skill_learning_enabled:
+            return None
+        score = float(validation.get("score", 0.0) or 0.0)
+        if score < max(0.65, self.execution_validation_threshold):
+            return None
+
+        blocked = {"record_memory_feedback", "record_skill_outcome", "create_skill"}
+        tool_calls: list[dict[str, Any]] = []
+        for payload in payloads[:8]:
+            name = str(payload.get("tool", "")).strip()
+            if not name or name in blocked:
+                continue
+            args = payload.get("args", {})
+            result = payload.get("result", {})
+            if isinstance(result, dict) and not result.get("ok", False):
+                return None
+            if not isinstance(args, dict):
+                args = {}
+            tool_calls.append({"tool": name, "args": args})
+        if not tool_calls:
+            return None
+
+        signature = "|".join(
+            f"{c['tool']}:{json.dumps(c.get('args', {}), sort_keys=True, ensure_ascii=False)}"
+            for c in tool_calls
+        )
+        if signature in learned_signatures:
+            return None
+        learned_signatures.add(signature)
+
+        action_slug = re.sub(r"[^a-z0-9_]+", "_", step.action.lower()).strip("_")
+        if not action_slug:
+            action_slug = "step"
+        skill_hash = abs(hash(signature)) % 100000
+        skill_name = f"auto_{action_slug[:28]}_{skill_hash}"
+        skill_key = action_slug[:40] or "step"
+        description = (
+            f"Auto-learned successful workflow for objective '{objective[:80]}' "
+            f"at step '{step.action}'."
+        )
+        keywords = self._extract_keywords(
+            f"{objective} {step.action} {step.expected_output}", limit=8
+        )
+        skill_inputs, steps_template = self._abstract_skill_template(tool_calls)
+        created = self.tools.execute(
+            "create_skill",
+            {
+                "name": skill_name,
+                "description": description,
+                "keywords": keywords,
+                "skill": skill_key,
+                "inputs": skill_inputs,
+                "steps_template": steps_template or tool_calls,
+                "match_conditions": keywords[:4],
+                "tool_calls": tool_calls,
+            },
+        )
+        if not created.get("ok", False):
+            return {"ok": False, "name": skill_name, "error": created.get("error", "")}
+
+        self.tools.execute(
+            "record_skill_outcome",
+            {
+                "name": skill_name,
+                "success": True,
+                "confidence": score,
+                "notes": "auto-learned from autonomous run",
+            },
+        )
+        return {"ok": True, "name": skill_name, "tool_calls": len(tool_calls)}

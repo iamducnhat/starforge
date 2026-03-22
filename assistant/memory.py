@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
 import re
+from hashlib import blake2b
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -15,13 +17,26 @@ class MemoryStore:
         self, blocks_dir: str | Path = "memory/blocks", embedding_dims: int = 256
     ) -> None:
         self.blocks_dir = Path(blocks_dir)
+        if self.blocks_dir.name == "blocks":
+            self.strategies_dir = self.blocks_dir.parent / "strategies"
+        else:
+            self.strategies_dir = self.blocks_dir.parent / f"{self.blocks_dir.name}_strategies"
+        self.root_causes_dir = self.blocks_dir.parent / "root_causes"
         self.embedding_dims = max(64, min(int(embedding_dims), 2048))
         ensure_dir(self.blocks_dir)
+        ensure_dir(self.strategies_dir)
+        ensure_dir(self.root_causes_dir)
         self.stats_path = self.blocks_dir / "_stats.json"
         self._metadata_cache: dict[str, dict[str, Any]] = {}
         self._stats_cache: dict[str, dict[str, Any]] = {}
+        self._strategy_cache: dict[str, dict[str, Any]] = {}
+        self._root_cause_cache: dict[str, list[dict[str, Any]]] = {}
+        self._root_cause_index: dict[str, tuple[Path, int]] = {}
+        self._root_cause_seed_files = ("import_errors.json", "test_failures.json")
         self._load_stats()
         self._load_metadata()  # Initial load
+        self._load_strategies()
+        self._load_root_causes()
 
     def _load_stats(self) -> None:
         try:
@@ -130,7 +145,10 @@ class MemoryStore:
 
         counts: dict[int, float] = {}
         for token in tokens:
-            bucket = hash(token) % self.embedding_dims
+            # Use deterministic hashing so semantic retrieval is stable across
+            # processes/runs (Python's built-in hash is randomized per process).
+            digest = blake2b(token.encode("utf-8"), digest_size=8).digest()
+            bucket = int.from_bytes(digest, "little") % self.embedding_dims
             counts[bucket] = counts.get(bucket, 0.0) + 1.0
 
         norm = math.sqrt(sum(v * v for v in counts.values()))
@@ -217,6 +235,453 @@ class MemoryStore:
             knowledge_path = block_dir / "knowledge.md"
             if info_path.exists() and knowledge_path.exists():
                 yield block_dir, info_path, knowledge_path
+
+    def _strategy_path(self, strategy_id: str) -> Path:
+        return self.strategies_dir / f"{strategy_id}.json"
+
+    def _root_cause_paths(self) -> list[Path]:
+        paths: list[Path] = []
+        for name in self._root_cause_seed_files:
+            path = self.root_causes_dir / name
+            if not path.exists():
+                write_json(path, [])
+            paths.append(path)
+        for path in sorted(self.root_causes_dir.glob("*.json")):
+            if path not in paths:
+                paths.append(path)
+        return paths
+
+    def _load_root_causes(self) -> None:
+        cache: dict[str, list[dict[str, Any]]] = {}
+        index: dict[str, tuple[Path, int]] = {}
+        for path in self._root_cause_paths():
+            try:
+                payload = read_json(path)
+            except Exception:
+                payload = []
+            if not isinstance(payload, list):
+                payload = []
+            normalized: list[dict[str, Any]] = []
+            for idx, raw_entry in enumerate(payload):
+                entry = self._normalize_root_cause_entry(raw_entry, path=path, idx=idx)
+                if not entry:
+                    continue
+                normalized.append(entry)
+                index[entry["id"]] = (path, len(normalized) - 1)
+            cache[path.name] = normalized
+        self._root_cause_cache = cache
+        self._root_cause_index = index
+
+    @staticmethod
+    def _normalize_root_cause_entry(
+        raw_entry: Any, *, path: Path, idx: int
+    ) -> dict[str, Any] | None:
+        if not isinstance(raw_entry, dict):
+            return None
+        pattern = str(raw_entry.get("pattern", "")).strip()
+        if not pattern:
+            return None
+        context = raw_entry.get("context", {})
+        if not isinstance(context, dict):
+            context = {}
+        fix_template = raw_entry.get("fix_template", [])
+        if not isinstance(fix_template, list):
+            fix_template = []
+        key_basis = json.dumps(
+            {"pattern": pattern, "context": context, "fix_template": fix_template},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        entry_id = str(raw_entry.get("id", "")).strip()
+        if not entry_id:
+            entry_id = f"{path.stem}_{blake2b(key_basis.encode('utf-8'), digest_size=5).hexdigest()}"
+        try:
+            confidence = float(raw_entry.get("confidence", 0.5))
+        except Exception:
+            confidence = 0.5
+        return {
+            "id": entry_id,
+            "pattern": pattern,
+            "context": context,
+            "fix_template": fix_template,
+            "success_count": int(raw_entry.get("success_count", 0) or 0),
+            "fail_count": int(raw_entry.get("fail_count", 0) or 0),
+            "confidence": max(0.0, min(confidence, 1.0)),
+        }
+
+    @staticmethod
+    def _placeholder_pattern_to_regex(pattern: str) -> tuple[str, list[str]]:
+        placeholders = re.findall(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}", pattern)
+        escaped = re.escape(pattern)
+        for name in placeholders:
+            escaped = escaped.replace(
+                re.escape("${" + name + "}"),
+                rf"(?P<{name}>[a-zA-Z0-9_.\-\/]+)",
+            )
+        return escaped, placeholders
+
+    @staticmethod
+    def _root_cause_context_match(
+        expected: dict[str, Any], runtime: dict[str, Any]
+    ) -> float:
+        if not expected:
+            return 0.2
+        matched = 0
+        total = 0
+        for key, value in expected.items():
+            total += 1
+            if str(runtime.get(key, "")).strip().lower() == str(value).strip().lower():
+                matched += 1
+        if total <= 0:
+            return 0.2
+        return matched / total
+
+    @classmethod
+    def _match_root_cause_pattern(
+        cls, entry: dict[str, Any], error_text: str
+    ) -> tuple[bool, dict[str, str], float]:
+        pattern = str(entry.get("pattern", "")).strip()
+        if not pattern or not error_text:
+            return False, {}, 0.0
+        captures: dict[str, str] = {}
+        text = error_text.strip()
+        lowered = text.lower()
+
+        if pattern.startswith("re:"):
+            raw = pattern[3:].strip()
+            if not raw:
+                return False, {}, 0.0
+            m = re.search(raw, text, re.IGNORECASE | re.DOTALL)
+            if not m:
+                return False, {}, 0.0
+            captures = {
+                str(k): str(v).strip()
+                for k, v in m.groupdict().items()
+                if v is not None and str(v).strip()
+            }
+            return True, captures, min(1.0, 0.55 + (len(m.group(0)) / max(60.0, len(text))))
+
+        regex, placeholders = cls._placeholder_pattern_to_regex(pattern)
+        m = re.search(regex, text, re.IGNORECASE)
+        if m:
+            for name in placeholders:
+                value = m.groupdict().get(name, "")
+                if value:
+                    captures[name] = str(value).strip()
+            return True, captures, min(1.0, 0.65 + (len(m.group(0)) / max(80.0, len(text))))
+
+        keywords = re.findall(r"[a-zA-Z0-9_]{3,}", pattern.lower())
+        if not keywords:
+            return False, {}, 0.0
+        overlap = sum(1 for kw in keywords if kw in lowered)
+        if overlap <= 0:
+            return False, {}, 0.0
+        keyword_score = overlap / max(1.0, len(keywords))
+        return True, {}, keyword_score * 0.6
+
+    @classmethod
+    def _interpolate_root_cause_template(
+        cls, value: Any, captures: dict[str, str]
+    ) -> Any:
+        if isinstance(value, str):
+            out = value
+            for key, captured in captures.items():
+                out = out.replace("${" + key + "}", str(captured))
+            return out
+        if isinstance(value, dict):
+            return {
+                str(k): cls._interpolate_root_cause_template(v, captures)
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._interpolate_root_cause_template(v, captures) for v in value]
+        return value
+
+    @staticmethod
+    def _normalize_strategy_step(step: Any, fallback_id: int) -> dict[str, Any]:
+        if not isinstance(step, dict):
+            return {
+                "step_id": fallback_id,
+                "action": str(step).strip() or f"step_{fallback_id}",
+                "args": {},
+                "depends_on": [fallback_id - 1] if fallback_id > 1 else [],
+                "expected_output": "",
+            }
+
+        raw_step_id = step.get("step_id", step.get("id", fallback_id))
+        try:
+            step_id = int(raw_step_id)
+        except Exception:
+            step_id = fallback_id
+        if step_id <= 0:
+            step_id = fallback_id
+
+        args = step.get("args", {})
+        if not isinstance(args, dict):
+            args = {}
+
+        deps: list[int] = []
+        raw_deps = step.get("depends_on", [])
+        if isinstance(raw_deps, list):
+            for item in raw_deps:
+                try:
+                    dep = int(item)
+                except Exception:
+                    continue
+                if dep > 0 and dep not in deps and dep != step_id:
+                    deps.append(dep)
+
+        return {
+            "step_id": step_id,
+            "action": str(step.get("action", "")).strip() or f"step_{step_id}",
+            "args": args,
+            "depends_on": deps,
+            "expected_output": str(
+                step.get("expected_output", "") or step.get("expected", "")
+            ).strip(),
+        }
+
+    def _strategy_embedding_source(self, strategy: dict[str, Any]) -> str:
+        parts = [str(strategy.get("goal", "")).strip()]
+        for step in strategy.get("strategy", []):
+            if not isinstance(step, dict):
+                continue
+            action = str(step.get("action", "")).strip()
+            expected = str(step.get("expected_output", "")).strip()
+            if action:
+                parts.append(action)
+            if expected:
+                parts.append(expected)
+            args = step.get("args", {})
+            if isinstance(args, dict):
+                for key, value in args.items():
+                    parts.append(f"{key} {value}")
+        notes = str(strategy.get("notes", "")).strip()
+        if notes:
+            parts.append(notes)
+        return "\n".join(part for part in parts if part)
+
+    def _load_strategies(self) -> None:
+        cache: dict[str, dict[str, Any]] = {}
+        for path in sorted(self.strategies_dir.glob("*.json")):
+            try:
+                item = read_json(path)
+            except Exception:
+                continue
+            if not isinstance(item, dict):
+                continue
+            strategy_id = str(item.get("id", path.stem)).strip() or path.stem
+            item["id"] = strategy_id
+            item["_path"] = str(path)
+            item["_embedding"] = self._embed_text(self._strategy_embedding_source(item))
+            cache[strategy_id] = item
+        self._strategy_cache = cache
+
+    def record_strategy(
+        self,
+        goal: str,
+        strategy: list[dict[str, Any]] | list[Any],
+        success: bool,
+        source: str = "runtime",
+        notes: str = "",
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_goal = str(goal or "").strip()
+        if not normalized_goal:
+            return {"ok": False, "error": "goal must not be empty"}
+
+        normalized_steps = [
+            self._normalize_strategy_step(step, idx)
+            for idx, step in enumerate(strategy or [], start=1)
+        ]
+        if not normalized_steps:
+            return {"ok": False, "error": "strategy must include at least one step"}
+
+        fingerprint_basis = json.dumps(
+            {"goal": normalized_goal, "strategy": normalized_steps},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        digest = blake2b(
+            fingerprint_basis.encode("utf-8"), digest_size=6
+        ).hexdigest()
+        base = slugify(normalized_goal) or "strategy"
+        strategy_id = f"{base[:48]}_{digest}"
+        path = self._strategy_path(strategy_id)
+
+        existing: dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = read_json(path)
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except Exception:
+                existing = {}
+
+        entry = {
+            "id": strategy_id,
+            "goal": normalized_goal,
+            "strategy": normalized_steps,
+            "context": context if isinstance(context, dict) else existing.get("context", {}),
+            "created_at": existing.get("created_at", utc_now_iso()),
+            "updated_at": utc_now_iso(),
+            "success_count": int(existing.get("success_count", 0) or 0),
+            "failure_count": int(existing.get("failure_count", 0) or 0),
+            "last_used_at": utc_now_iso(),
+            "last_success_at": existing.get("last_success_at", ""),
+            "source": str(source or existing.get("source", "runtime")),
+            "notes": str(notes or existing.get("notes", "")).strip()[:800],
+        }
+        if success:
+            entry["success_count"] += 1
+            entry["last_success_at"] = utc_now_iso()
+        else:
+            entry["failure_count"] += 1
+
+        write_json(path, entry)
+        entry["_path"] = str(path)
+        entry["_embedding"] = self._embed_text(self._strategy_embedding_source(entry))
+        self._strategy_cache[strategy_id] = entry
+        return {"ok": True, "strategy": entry}
+
+    def find_strategies(
+        self, query: str, limit: int = 5, min_score: float = 0.15
+    ) -> list[dict[str, Any]]:
+        query_text = str(query or "").strip()
+        if not query_text:
+            return []
+
+        query_embedding = self._embed_text(query_text)
+        if not query_embedding:
+            return []
+
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for item in self._strategy_cache.values():
+            semantic = self._cosine_sparse(query_embedding, item.get("_embedding", {}))
+            success_count = float(item.get("success_count", 0.0) or 0.0)
+            failure_count = float(item.get("failure_count", 0.0) or 0.0)
+            total = max(1.0, success_count + failure_count)
+            success_ratio = success_count / total
+            score = (
+                semantic
+                + (success_ratio * 0.45)
+                + self._recency_bonus(
+                    str(item.get("created_at", "")),
+                    str(item.get("last_success_at", "")),
+                )
+            )
+            if score < min_score:
+                continue
+            scored.append((score, item))
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        out: list[dict[str, Any]] = []
+        for score, item in scored[: max(1, limit)]:
+            out.append(
+                {
+                    "id": item.get("id", ""),
+                    "goal": item.get("goal", ""),
+                    "strategy": item.get("strategy", []),
+                    "context": item.get("context", {}),
+                    "success_count": int(item.get("success_count", 0) or 0),
+                    "failure_count": int(item.get("failure_count", 0) or 0),
+                    "success_rate": round(success_ratio, 3),
+                    "last_success_at": item.get("last_success_at", ""),
+                    "score": round(score, 3),
+                }
+            )
+        return out
+
+    def find_root_causes(
+        self,
+        error_text: str,
+        context: dict[str, Any] | None = None,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        text = str(error_text or "").strip()
+        if not text:
+            return []
+        runtime_context = context if isinstance(context, dict) else {}
+        candidates: list[dict[str, Any]] = []
+        for entries in self._root_cause_cache.values():
+            for entry in entries:
+                matched, captures, pattern_score = self._match_root_cause_pattern(entry, text)
+                if not matched:
+                    continue
+                context_score = self._root_cause_context_match(
+                    entry.get("context", {}), runtime_context
+                )
+                if context_score <= 0.0:
+                    continue
+                success = float(entry.get("success_count", 0.0) or 0.0)
+                failures = float(entry.get("fail_count", 0.0) or 0.0)
+                observed = max(1.0, success + failures)
+                success_ratio = success / observed
+                confidence = float(entry.get("confidence", 0.0) or 0.0)
+                score = (
+                    (pattern_score * 0.55)
+                    + (context_score * 0.2)
+                    + (confidence * 0.2)
+                    + (success_ratio * 0.15)
+                )
+                interpolated = self._interpolate_root_cause_template(
+                    entry.get("fix_template", []), captures
+                )
+                candidates.append(
+                    {
+                        "id": entry.get("id", ""),
+                        "pattern": entry.get("pattern", ""),
+                        "context": entry.get("context", {}),
+                        "captures": captures,
+                        "fix_template": interpolated if isinstance(interpolated, list) else [],
+                        "confidence": round(confidence, 3),
+                        "success_count": int(success),
+                        "fail_count": int(failures),
+                        "score": round(score, 3),
+                    }
+                )
+        candidates.sort(key=lambda item: float(item.get("score", 0.0) or 0.0), reverse=True)
+        return candidates[: max(1, limit)]
+
+    def record_root_cause_feedback(
+        self, root_cause_id: str, success: bool, confidence: float = 1.0
+    ) -> dict[str, Any]:
+        root_id = str(root_cause_id or "").strip()
+        if not root_id:
+            return {"ok": False, "error": "root_cause_id is required"}
+        located = self._root_cause_index.get(root_id)
+        if located is None:
+            return {"ok": False, "error": f"unknown root cause id: {root_id}"}
+        path, idx = located
+        entries = self._root_cause_cache.get(path.name, [])
+        if idx < 0 or idx >= len(entries):
+            return {"ok": False, "error": f"root cause not found in cache: {root_id}"}
+        entry = entries[idx]
+        if success:
+            entry["success_count"] = int(entry.get("success_count", 0) or 0) + 1
+        else:
+            entry["fail_count"] = int(entry.get("fail_count", 0) or 0) + 1
+        try:
+            conf = float(confidence)
+        except Exception:
+            conf = 1.0
+        conf = max(0.0, min(conf, 1.0))
+        current = float(entry.get("confidence", 0.5) or 0.5)
+        entry["confidence"] = round((current * 0.8) + (conf * 0.2), 4)
+        serializable = [
+            {
+                "id": item.get("id", ""),
+                "pattern": item.get("pattern", ""),
+                "context": item.get("context", {}),
+                "fix_template": item.get("fix_template", []),
+                "success_count": int(item.get("success_count", 0) or 0),
+                "fail_count": int(item.get("fail_count", 0) or 0),
+                "confidence": float(item.get("confidence", 0.0) or 0.0),
+            }
+            for item in entries
+        ]
+        write_json(path, serializable)
+        return {"ok": True, "id": root_id, "entry": entry}
 
     def semantic_search(
         self, query: str, limit: int = 5, min_score: float = 0.1
