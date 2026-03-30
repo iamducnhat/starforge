@@ -44,14 +44,14 @@ class ExecutionState:
     external_knowledge_acquired: bool = False
     autonomous_replan_count: int = 0
     no_progress_streak: int = 0
-    model_replan_count: int = 0
     model_marked_complete: bool = False
     model_final_answer: str = ""
     model_orchestrated: bool = False
     model_feedback_available: bool = False
     require_done_stop_token: bool = False
-    done_stop_token: str = "DONE-STOP-AUTONOMOUS"
+    done_stop_token: str = "DONE_STOP_AUTONOMOUS"
     done_stop_seen: bool = False
+    done_token_poke_count: int = 0
     model_audit: dict[str, Any] = field(default_factory=dict)
     model_audit_count: int = 0
 
@@ -852,10 +852,10 @@ class StarforgeRuntime:
         max_steps = configured_max_steps if configured_max_steps > 0 else 0
         mode = str(config.get("mode", "autonomous"))
         model_feedback_enabled = bool(config.get("model_feedback", True)) and mode.strip().lower() == "autonomous"
-        max_model_replans = max(0, int(config.get("max_model_replans", 3)))
+        max_done_token_pokes = max(0, int(config.get("max_done_token_pokes", 0)))
         max_no_progress_streak = max(1, int(config.get("max_no_progress_streak", 3)))
         model_orchestrated_requested = bool(config.get("model_orchestrated", False))
-        done_stop_token = str(config.get("done_stop_token", "DONE-STOP-AUTONOMOUS")).strip() or "DONE-STOP-AUTONOMOUS"
+        done_stop_token = str(config.get("done_stop_token", "DONE_STOP_AUTONOMOUS")).strip() or "DONE_STOP_AUTONOMOUS"
         feedback_model = self._build_feedback_model(config=config) if model_feedback_enabled else None
         model_orchestrated = bool(model_feedback_enabled and feedback_model is not None and model_orchestrated_requested)
         require_done_stop_token = bool(
@@ -929,8 +929,16 @@ class StarforgeRuntime:
                         state.notes.append("Stopping: objective appears complete from model synthesis.")
                         break
 
-                if feedback_model is not None and state.model_replan_count < max_model_replans:
-                    state.model_replan_count += 1
+                should_request_model_feedback = feedback_model is not None and (
+                    not state.require_done_stop_token
+                    or (
+                        not state.done_stop_seen
+                        and (max_done_token_pokes == 0 or state.done_token_poke_count < max_done_token_pokes)
+                    )
+                )
+                if should_request_model_feedback:
+                    if state.require_done_stop_token and not state.done_stop_seen:
+                        state.done_token_poke_count += 1
                     before = len(state.pending)
                     suggested_actions = self._model_feedback_actions(
                         state=state,
@@ -944,17 +952,25 @@ class StarforgeRuntime:
                 if self.planner.autonomous_replan(state):
                     continue
 
-                if local_feedback_fallback and state.model_replan_count < max_model_replans:
-                    state.model_replan_count += 1
+                if local_feedback_fallback:
                     suggested_action = self._local_feedback_action(state=state)
                     if suggested_action is not None:
                         self.planner._enqueue_unique(state, suggested_action)
                         continue
 
                 if state.require_done_stop_token:
-                    if max_model_replans > 0 and state.model_replan_count >= max_model_replans:
+                    if (
+                        feedback_model is not None
+                        and (max_done_token_pokes == 0 or state.done_token_poke_count < max_done_token_pokes)
+                    ):
                         state.notes.append(
-                            f"Stopping: model replan budget reached before token '{state.done_stop_token}'."
+                            "Completion token still missing; continuing autonomous pokes with latest evidence."
+                        )
+                        continue
+                    if max_done_token_pokes > 0 and state.done_token_poke_count >= max_done_token_pokes:
+                        state.notes.append(
+                            f"Stopping: completion token '{state.done_stop_token}' not received after "
+                            f"{state.done_token_poke_count} model pokes."
                         )
                         break
                     if feedback_model is None:
@@ -1348,6 +1364,8 @@ class StarforgeRuntime:
         plan_examples_text = json.dumps(state.plan_examples[:2], ensure_ascii=False)
         system_prompt = (
             "You are the autonomous replanner for Starforge.\n"
+            "Before proposing any action, define an internal completion standard for the objective "
+            "(required evidence + final deliverable constraints) and use it to evaluate progress on every turn.\n"
             "Choose the next tool call(s) that best advance the objective.\n"
             "You may revise the previous approach if new evidence suggests a better move.\n"
             "You may return a short subplan as multiple tool calls when one step is not enough.\n"
@@ -1363,6 +1381,8 @@ class StarforgeRuntime:
             system_prompt += (
                 f"\nStrict completion rule: only declare completion when final_answer includes "
                 f"the exact token '{state.done_stop_token}'."
+                "\nBefore every completion attempt, verify the objective is fully satisfied; "
+                "if not, return concrete tool calls instead of done=true."
             )
         user_prompt = (
             f"Objective:\n{state.objective}\n\n"

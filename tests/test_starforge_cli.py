@@ -59,8 +59,6 @@ def test_run_forwards_model_feedback_options() -> None:
                 "run",
                 "demo objective",
                 "--model-feedback",
-                "--max-model-replans",
-                "5",
                 "--model-name",
                 "qwen2.5:7b",
                 "--model-provider",
@@ -73,7 +71,6 @@ def test_run_forwards_model_feedback_options() -> None:
     _, kwargs = mocked.call_args
     config = kwargs["config"]
     assert config["model_feedback"] is True
-    assert config["max_model_replans"] == 5
     assert config["model_name"] == "qwen2.5:7b"
     assert config["feedback_provider"] == "ollama"
     assert config["model_orchestrated"] is True
