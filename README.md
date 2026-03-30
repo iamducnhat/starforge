@@ -117,7 +117,7 @@ Model feedback can use:
 When model-orchestrated mode is enabled with a required completion token (default: `DONE_STOP_AUTONOMOUS`), completion is validated with a quality review before stopping:
 
 - The model should return structured completion JSON with `self_review.score` in `[0, 1]` and a short result summary.
-- Default completion threshold is `0.9` (`completion_score_threshold`).
+- Default completion threshold is `0.97` (`completion_score_threshold`).
 - If score is below threshold, Starforge requests one refine cycle by default (`completion_max_refines=1`).
 - After the refine budget is used, the model may still stop by setting `cannot_improve=true` in `self_review`.
 
@@ -128,7 +128,7 @@ Example completion payload:
   "done": true,
   "final_answer": "All required checks passed. DONE_STOP_AUTONOMOUS",
   "self_review": {
-    "score": 0.93,
+    "score": 0.98,
     "result": "Objective satisfied with test and file evidence."
   }
 }

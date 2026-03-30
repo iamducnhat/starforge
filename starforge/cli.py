@@ -348,6 +348,20 @@ def _print_run_result(result: dict[str, Any], human_mode: bool, *, ansi_enabled:
     print(f"{_style('Success', ANSI_BOLD, enabled=ansi_enabled)}: {success_text}")
     print(f"{_style('Steps', ANSI_BOLD, enabled=ansi_enabled)}: {int(result.get('steps', 0) or 0)}")
     print(f"{_style('Confidence', ANSI_BOLD, enabled=ansi_enabled)}: {result.get('confidence', 0.0)}")
+    model_audit = payload.get("model_audit") if isinstance(payload.get("model_audit"), dict) else {}
+    if model_audit:
+        print("")
+        print(_style("Completion audit:", ANSI_BOLD, ANSI_YELLOW, enabled=ansi_enabled))
+        print(f"- pass: {bool(model_audit.get('pass'))}")
+        if model_audit.get("score") is not None:
+            print(f"- score: {model_audit.get('score')}")
+        if model_audit.get("threshold") is not None:
+            print(f"- threshold: {model_audit.get('threshold')}")
+        result_text = str(model_audit.get("result", "")).strip()
+        if result_text:
+            print(f"- result: {_truncate(result_text, limit=200)}")
+        if model_audit.get("cannot_improve") is not None:
+            print(f"- cannot_improve: {bool(model_audit.get('cannot_improve'))}")
 
     actions = result.get("actions") if isinstance(result.get("actions"), list) else []
     if actions:
@@ -387,6 +401,31 @@ def _print_run_result(result: dict[str, Any], human_mode: bool, *, ansi_enabled:
         summary = _observation_summary(observation)
         if summary:
             print(f"   result: {summary}")
+
+    terminal_logs: list[tuple[str, str]] = []
+    for action in actions:
+        item = dict(action) if isinstance(action, dict) else {}
+        observation = item.get("observation") if isinstance(item.get("observation"), dict) else {}
+        if str(observation.get("type")) != "command_result":
+            continue
+        content = observation.get("content")
+        if not isinstance(content, dict):
+            continue
+        command = str(content.get("command") or "").strip() or "<unknown command>"
+        merged_output = str(content.get("stdout") or "").strip()
+        stderr = str(content.get("stderr") or "").strip()
+        if stderr:
+            merged_output = f"{merged_output}\n{stderr}".strip() if merged_output else stderr
+        if merged_output:
+            terminal_logs.append((command, merged_output))
+    if terminal_logs:
+        print("")
+        print(_style("Terminal output log:", ANSI_BOLD, ANSI_YELLOW, enabled=ansi_enabled))
+        for index, (command, output) in enumerate(terminal_logs, start=1):
+            print(f"{index}. command: {command}")
+            print("   output:")
+            for line in output.splitlines()[:20]:
+                print(f"     {line}")
 
 
 def _build_stream_callback(*, human_mode: bool, ansi_enabled: bool = False):

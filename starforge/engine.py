@@ -53,8 +53,9 @@ class ExecutionState:
     done_stop_seen: bool = False
     done_token_poke_count: int = 0
     model_audit: dict[str, Any] = field(default_factory=dict)
+    model_audit_log: list[dict[str, Any]] = field(default_factory=list)
     model_audit_count: int = 0
-    completion_score_threshold: float = 0.9
+    completion_score_threshold: float = 0.97
     completion_refine_attempts: int = 0
     completion_max_refines: int = 1
     completion_no_further_upgrade_ack: bool = False
@@ -240,6 +241,7 @@ class DefaultPlanner:
             "memory_hits": state.memory_hits,
             "model_final_answer": state.model_final_answer,
             "model_audit": state.model_audit,
+            "model_audit_log": state.model_audit_log,
             "human_readable": self._render_human_readable_summary(state),
         }
         output_path = state.context.metadata.get("output_path")
@@ -325,6 +327,18 @@ class DefaultPlanner:
             if isinstance(gaps, list):
                 for item in gaps[:5]:
                     lines.append(f"- gap: {item}")
+        if state.model_audit_log:
+            lines.append("")
+            lines.append("Model Self-Audit Output Log:")
+            for item in state.model_audit_log[-5:]:
+                lines.append(
+                    "- "
+                    + json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
         return "\n".join(lines).strip() + "\n"
 
     def _render_human_readable_summary(self, state: ExecutionState) -> str:
@@ -890,7 +904,7 @@ class StarforgeRuntime:
             model_feedback_available=feedback_model is not None,
             require_done_stop_token=require_done_stop_token,
             done_stop_token=done_stop_token,
-            completion_score_threshold=max(0.0, min(1.0, float(config.get("completion_score_threshold", 0.9)))),
+            completion_score_threshold=max(0.0, min(1.0, float(config.get("completion_score_threshold", 0.97)))),
             completion_max_refines=max(0, int(config.get("completion_max_refines", 1))),
         )
         self.planner.bootstrap(state)
@@ -1279,6 +1293,17 @@ class StarforgeRuntime:
             "cannot_improve": cannot_improve,
             "threshold": state.completion_score_threshold,
         }
+        state.model_audit_log.append(
+            {
+                "attempt": state.model_audit_count,
+                "score": score,
+                "result": reason,
+                "pass": bool(score is not None and score >= state.completion_score_threshold),
+                "cannot_improve": cannot_improve,
+                "threshold": state.completion_score_threshold,
+                "final_answer": state.model_final_answer[:300],
+            }
+        )
         if score is None:
             state.model_marked_complete = False
             state.notes.append(
@@ -1458,6 +1483,9 @@ class StarforgeRuntime:
             "If the objective is fully complete, output: {\"done\":true,\"final_answer\":\"...\"}.\n"
             "When declaring completion, include a self-review score in [0,1] and result summary, e.g. "
             "{\"done\":true,\"final_answer\":\"...\",\"self_review\":{\"score\":0.93,\"result\":\"...\"}}.\n"
+            "Before every done=true attempt, ask yourself this question and act on it: "
+            "\"What concrete change would make this answer more amazing, more complete, and more reliable right now?\"\n"
+            "Keep iterating improvements until there is no meaningful upgrade left.\n"
             "Do not invent tools outside the allowed list."
         )
         if state.require_done_stop_token:
@@ -1475,6 +1503,8 @@ class StarforgeRuntime:
         user_prompt = (
             f"Objective:\n{state.objective}\n\n"
             f"Available tools:\n{', '.join(state.available_tools)}\n\n"
+            f"Current self-audit output log (latest first):\n"
+            f"{json.dumps(list(reversed(state.model_audit_log[-5:])), ensure_ascii=False)}\n\n"
             f"Relevant memory hits (if any):\n{memory_hits_text}\n\n"
             f"Relevant prior plans from memory/plans (if any):\n{plan_examples_text}\n\n"
             f"All previous tool results as JSON:\n{action_history}"

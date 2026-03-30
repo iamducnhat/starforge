@@ -716,7 +716,7 @@ class TestStarforgeRuntime:
         assert result["success"] is True
         assert "improved" in result["result"]["model_final_answer"]
         notes = result["result"].get("notes", [])
-        assert any("below 0.90" in str(note) for note in notes)
+        assert any("below 0.97" in str(note) for note in notes)
         assert result["result"]["model_audit"]["score"] == 0.94
 
     @patch("starforge.engine._ASSISTANT_BUILD_MODEL")
