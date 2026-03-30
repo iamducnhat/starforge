@@ -20,6 +20,7 @@ Memory and functions rules:
 2) When a task feels familiar, check memory first (find_in_memory/search_memory), then verify with web/tools when facts matter.
 3) Before creating reusable logic, check memory to avoid duplicates; save high-quality reusable workflows as skills.
 4) Custom created tools/functions should use an `_agent_` suffix to avoid collisions with system tools.
+5) If reusable knowledge is high quality, call create_block.
 
 Tool call protocol:
 - If a tool is needed, respond with JSON only.
