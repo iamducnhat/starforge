@@ -155,12 +155,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable model-in-the-loop replanning when autonomous queue becomes empty (default: enabled).",
     )
     run_parser.add_argument(
-        "--max-model-replans",
-        type=int,
-        default=3,
-        help="Maximum model-feedback replans when autonomous queue is exhausted. Default: 3.",
-    )
-    run_parser.add_argument(
         "--model-name",
         default="",
         help="Optional model name override for autonomous model feedback.",
@@ -481,7 +475,6 @@ def main(argv: list[str] | None = None) -> int:
             "adapter": args.adapter,
             "memory_root": args.memory_root or None,
             "model_feedback": bool(args.model_feedback),
-            "max_model_replans": args.max_model_replans,
             "model_name": args.model_name or None,
             "feedback_provider": args.model_provider or None,
             "model_orchestrated": bool(args.model_orchestrated),

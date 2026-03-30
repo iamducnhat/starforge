@@ -427,7 +427,6 @@ class TestStarforgeRuntime:
                 "max_steps": 0,
                 "mode": "autonomous",
                 "model_feedback": True,
-                "max_model_replans": 1,
                 "memory_root": str(tmp_path / "memory"),
             },
         )
@@ -461,7 +460,6 @@ class TestStarforgeRuntime:
                 "max_steps": 4,
                 "mode": "autonomous",
                 "model_feedback": True,
-                "max_model_replans": 1,
                 "memory_root": str(tmp_path / "memory"),
             },
         )
@@ -505,7 +503,6 @@ class TestStarforgeRuntime:
                 "max_steps": 0,
                 "mode": "autonomous",
                 "model_feedback": True,
-                "max_model_replans": 2,
                 "memory_root": str(tmp_path / "memory"),
             },
         )
@@ -603,8 +600,8 @@ class TestStarforgeRuntime:
                 if self.calls == 2:
                     return '{"tool":"read_file","args":{"path":"hello.txt"}}'
                 if self.calls == 3:
-                    return '{"done":true,"final_answer":"draft complete DONE-STOP-AUTONOMOUS"}'
-                return '{"done":true,"final_answer":"draft complete DONE-STOP-AUTONOMOUS"}'
+                    return '{"done":true,"final_answer":"draft complete DONE_STOP_AUTONOMOUS"}'
+                return '{"done":true,"final_answer":"draft complete DONE_STOP_AUTONOMOUS"}'
 
         mock_build_model.return_value = _StubModel()
         (tmp_path / "hello.txt").write_text("hello\n", encoding="utf-8")
@@ -620,7 +617,6 @@ class TestStarforgeRuntime:
                 "model_orchestrated": True,
                 "model_name": "gemini-3.1-pro-preview",
                 "feedback_provider": "google",
-                "max_model_replans": 6,
                 "memory_root": str(tmp_path / "memory"),
             },
         )
@@ -629,9 +625,54 @@ class TestStarforgeRuntime:
         assert tools[0] == "web_search"
         assert "web_search" in tools
         assert "read_file" in tools
-        assert "DONE-STOP-AUTONOMOUS" in result["result"]["model_final_answer"]
+        assert "DONE_STOP_AUTONOMOUS" in result["result"]["model_final_answer"]
         notes = result["result"].get("notes", [])
         assert any("model-orchestrated execution is enabled" in str(note).lower() for note in notes)
+
+    @patch("starforge.engine._ASSISTANT_BUILD_MODEL")
+    def test_model_orchestrated_keeps_poking_until_done_token_or_poke_budget(
+        self,
+        mock_build_model: Mock,
+        tmp_path: Path,
+    ) -> None:
+        class _StubModel:
+            provider = "google"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate(self, messages):  # noqa: ANN001 - test double
+                del messages
+                self.calls += 1
+                if self.calls == 1:
+                    return '{"tool":"read_file","args":{"path":"hello.txt"}}'
+                if self.calls < 4:
+                    return '{"done":true,"final_answer":"draft complete"}'
+                return '{"done":true,"final_answer":"draft complete DONE_STOP_AUTONOMOUS"}'
+
+        mock_build_model.return_value = _StubModel()
+        (tmp_path / "hello.txt").write_text("hello\n", encoding="utf-8")
+
+        result = run(
+            objective="inspect hello.txt and verify completion",
+            context={"working_dir": str(tmp_path)},
+            config={
+                "adapter": "cli",
+                "max_steps": 0,
+                "mode": "autonomous",
+                "model_feedback": True,
+                "model_orchestrated": True,
+                "model_name": "gemini-3.1-pro-preview",
+                "feedback_provider": "google",
+                "max_done_token_pokes": 5,
+                "memory_root": str(tmp_path / "memory"),
+            },
+        )
+
+        assert result["success"] is True
+        assert "DONE_STOP_AUTONOMOUS" in result["result"]["model_final_answer"]
+        notes = result["result"].get("notes", [])
+        assert any("without required token" in str(note).lower() for note in notes)
 
     @patch("starforge.engine._ASSISTANT_BUILD_MODEL")
     def test_model_orchestrated_without_backend_stops_with_explicit_note(
@@ -700,7 +741,6 @@ class TestStarforgeRuntime:
                 "max_steps": 0,
                 "mode": "autonomous",
                 "model_feedback": True,
-                "max_model_replans": 1,
                 "memory_root": str(tmp_path / "memory"),
             },
         )
