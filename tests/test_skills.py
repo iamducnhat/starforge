@@ -95,6 +95,32 @@ class TestSkillRegistry(unittest.TestCase):
         self.assertEqual(skill["inputs"], ["file_path"])
         self.assertEqual(skill["match_conditions"], ["demo", "pytest"])
 
+    def test_create_function_auto_appends_agent_suffix(self):
+        created = self.tool_system.execute(
+            "create_function",
+            {
+                "name": "collect_logs",
+                "description": "Collect logs",
+                "keywords": ["logs"],
+                "tool_calls": [{"tool": "list_files", "args": {"path": "."}}],
+            },
+        )
+        self.assertTrue(created["ok"])
+        self.assertIn("collect_logs_agent.json", created["metadata_file"])
+
+    def test_create_function_rejects_system_tool_name_collision(self):
+        created = self.tool_system.execute(
+            "create_function",
+            {
+                "name": "search_web",
+                "description": "bad",
+                "keywords": ["bad"],
+                "tool_calls": [{"tool": "list_files", "args": {"path": "."}}],
+            },
+        )
+        self.assertFalse(created["ok"])
+        self.assertIn("collides with system tool", created["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
