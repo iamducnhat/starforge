@@ -675,6 +675,98 @@ class TestStarforgeRuntime:
         assert any("without required token" in str(note).lower() for note in notes)
 
     @patch("starforge.engine._ASSISTANT_BUILD_MODEL")
+    def test_model_orchestrated_requires_completion_score_and_refines_once(
+        self,
+        mock_build_model: Mock,
+        tmp_path: Path,
+    ) -> None:
+        class _StubModel:
+            provider = "google"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate(self, messages):  # noqa: ANN001 - test double
+                del messages
+                self.calls += 1
+                if self.calls == 1:
+                    return '{"tool":"read_file","args":{"path":"hello.txt"}}'
+                if self.calls == 2:
+                    return '{"done":true,"final_answer":"draft DONE_STOP_AUTONOMOUS","self_review":{"score":0.72,"result":"partial"}}'
+                return '{"done":true,"final_answer":"improved DONE_STOP_AUTONOMOUS","self_review":{"score":0.94,"result":"complete"}}'
+
+        mock_build_model.return_value = _StubModel()
+        (tmp_path / "hello.txt").write_text("hello\n", encoding="utf-8")
+
+        result = run(
+            objective="inspect hello.txt and verify completion",
+            context={"working_dir": str(tmp_path)},
+            config={
+                "adapter": "cli",
+                "max_steps": 0,
+                "mode": "autonomous",
+                "model_feedback": True,
+                "model_orchestrated": True,
+                "model_name": "gemini-3.1-pro-preview",
+                "feedback_provider": "google",
+                "memory_root": str(tmp_path / "memory"),
+            },
+        )
+
+        assert result["success"] is True
+        assert "improved" in result["result"]["model_final_answer"]
+        notes = result["result"].get("notes", [])
+        assert any("below 0.90" in str(note) for note in notes)
+        assert result["result"]["model_audit"]["score"] == 0.94
+
+    @patch("starforge.engine._ASSISTANT_BUILD_MODEL")
+    def test_model_orchestrated_accepts_cannot_improve_after_refine_budget(
+        self,
+        mock_build_model: Mock,
+        tmp_path: Path,
+    ) -> None:
+        class _StubModel:
+            provider = "google"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate(self, messages):  # noqa: ANN001 - test double
+                del messages
+                self.calls += 1
+                if self.calls == 1:
+                    return '{"tool":"read_file","args":{"path":"hello.txt"}}'
+                if self.calls == 2:
+                    return '{"done":true,"final_answer":"first DONE_STOP_AUTONOMOUS","self_review":{"score":0.60,"result":"weak"}}'
+                if self.calls == 3:
+                    return '{"done":true,"final_answer":"second DONE_STOP_AUTONOMOUS","self_review":{"score":0.70,"result":"better"}}'
+                return '{"done":true,"final_answer":"final DONE_STOP_AUTONOMOUS","self_review":{"score":0.70,"result":"plateau","cannot_improve":true}}'
+
+        mock_build_model.return_value = _StubModel()
+        (tmp_path / "hello.txt").write_text("hello\n", encoding="utf-8")
+
+        result = run(
+            objective="inspect hello.txt and verify completion",
+            context={"working_dir": str(tmp_path)},
+            config={
+                "adapter": "cli",
+                "max_steps": 0,
+                "mode": "autonomous",
+                "model_feedback": True,
+                "model_orchestrated": True,
+                "model_name": "gemini-3.1-pro-preview",
+                "feedback_provider": "google",
+                "memory_root": str(tmp_path / "memory"),
+            },
+        )
+
+        assert result["success"] is True
+        assert "final" in result["result"]["model_final_answer"]
+        assert result["result"]["model_audit"]["cannot_improve"] is True
+        notes = result["result"].get("notes", [])
+        assert any("no further upgrade" in str(note).lower() for note in notes)
+
+    @patch("starforge.engine._ASSISTANT_BUILD_MODEL")
     def test_model_orchestrated_without_backend_stops_with_explicit_note(
         self,
         mock_build_model: Mock,

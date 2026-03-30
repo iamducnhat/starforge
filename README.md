@@ -16,6 +16,7 @@ It is designed to run domain-agnostic objectives through tools, not through hard
 - Task-agnostic engine: `run(objective="analyze BTC trend and summarize key signals")`
 - Simple adaptive loop: act -> observe -> adapt -> repeat
 - Optional model-feedback replanning in autonomous mode: when the tool queue is empty, Starforge can ask a model for the next tool call and continue iterating
+- Completion quality gate for model-orchestrated runs: done-token completions are scored and may be refined before stop
 - Tool-based execution: the runtime acts through tools such as `run_command`, `read_file`, `write_file`, `http_request`, `web_search`, and `read_webpage`
 - Structured observations: every tool returns a normalized observation payload
 - Portable memory: reusable patterns live in `~/.starforge/`, not inside project repos
@@ -110,6 +111,35 @@ Model feedback can use:
 - Ollama (`--model-provider ollama --model-name qwen2.5:7b`)
 - OpenRouter (`OPENROUTER_API_KEY=...` + `--model-provider openrouter`)
 - Google / Nvidia providers via their API keys.
+
+### Model-Orchestrated Completion Gate
+
+When model-orchestrated mode is enabled with a required completion token (default: `DONE_STOP_AUTONOMOUS`), completion is validated with a quality review before stopping:
+
+- The model should return structured completion JSON with `self_review.score` in `[0, 1]` and a short result summary.
+- Default completion threshold is `0.9` (`completion_score_threshold`).
+- If score is below threshold, Starforge requests one refine cycle by default (`completion_max_refines=1`).
+- After the refine budget is used, the model may still stop by setting `cannot_improve=true` in `self_review`.
+
+Example completion payload:
+
+```json
+{
+  "done": true,
+  "final_answer": "All required checks passed. DONE_STOP_AUTONOMOUS",
+  "self_review": {
+    "score": 0.93,
+    "result": "Objective satisfied with test and file evidence."
+  }
+}
+```
+
+Useful config keys:
+
+- `require_done_stop_token` (bool): enforce explicit done token on completion.
+- `done_stop_token` (str): completion token text (default `DONE_STOP_AUTONOMOUS`).
+- `completion_score_threshold` (float): minimum acceptable self-review score.
+- `completion_max_refines` (int): refine attempts before `cannot_improve` can be accepted.
 
 ```bash
 starforge run --objective "fix build errors" --adapter code --working-dir ./demo_project --command "pytest -q"
