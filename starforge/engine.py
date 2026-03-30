@@ -54,6 +54,10 @@ class ExecutionState:
     done_token_poke_count: int = 0
     model_audit: dict[str, Any] = field(default_factory=dict)
     model_audit_count: int = 0
+    completion_score_threshold: float = 0.9
+    completion_refine_attempts: int = 0
+    completion_max_refines: int = 1
+    completion_no_further_upgrade_ack: bool = False
 
 
 class DefaultPlanner:
@@ -886,6 +890,8 @@ class StarforgeRuntime:
             model_feedback_available=feedback_model is not None,
             require_done_stop_token=require_done_stop_token,
             done_stop_token=done_stop_token,
+            completion_score_threshold=max(0.0, min(1.0, float(config.get("completion_score_threshold", 0.9)))),
+            completion_max_refines=max(0, int(config.get("completion_max_refines", 1))),
         )
         self.planner.bootstrap(state)
         if model_orchestrated:
@@ -931,6 +937,7 @@ class StarforgeRuntime:
 
                 should_request_model_feedback = feedback_model is not None and (
                     not state.require_done_stop_token
+                    or (state.done_stop_seen and not state.model_marked_complete)
                     or (
                         not state.done_stop_seen
                         and (max_done_token_pokes == 0 or state.done_token_poke_count < max_done_token_pokes)
@@ -961,6 +968,7 @@ class StarforgeRuntime:
                 if state.require_done_stop_token:
                     if (
                         feedback_model is not None
+                        and not state.done_stop_seen
                         and (max_done_token_pokes == 0 or state.done_token_poke_count < max_done_token_pokes)
                     ):
                         state.notes.append(
@@ -1187,17 +1195,16 @@ class StarforgeRuntime:
                 "Reflection: model feedback proposed follow-up tool calls, so autonomous execution should continue."
             )
             return suggested
-        if state.require_done_stop_token and state.done_stop_token.lower() in raw.lower():
-            state.done_stop_seen = True
-            state.model_marked_complete = True
-            state.model_final_answer = raw[:4000]
-            state.notes.append(
-                f"Model supplied completion with required token '{state.done_stop_token}'."
-            )
-            return []
 
         payload = _ASSISTANT_PARSE_JSON_PAYLOAD(raw)
         if not isinstance(payload, dict):
+            if state.require_done_stop_token and state.done_stop_token.lower() in raw.lower():
+                state.done_stop_seen = True
+                state.model_final_answer = raw[:4000]
+                state.model_marked_complete = False
+                state.notes.append(
+                    "Completion token detected, but a structured completion payload with score is required before stopping."
+                )
             return []
 
         done = bool(payload.get("done")) or str(payload.get("status", "")).strip().lower() in {"done", "complete"}
@@ -1222,7 +1229,81 @@ class StarforgeRuntime:
             else:
                 state.model_marked_complete = True
                 state.notes.append("Model supplied a final synthesis from gathered evidence.")
+            self._apply_completion_quality_gate(state=state, payload=payload)
         return []
+
+    @staticmethod
+    def _coerce_score(payload: dict[str, Any]) -> float | None:
+        candidates = [
+            payload.get("score"),
+            payload.get("result_score"),
+            payload.get("performance_score"),
+        ]
+        review = payload.get("self_review")
+        if isinstance(review, dict):
+            candidates.extend(
+                [
+                    review.get("score"),
+                    review.get("result_score"),
+                    review.get("performance_score"),
+                ]
+            )
+        for value in candidates:
+            try:
+                score = float(value)
+            except (TypeError, ValueError):
+                continue
+            return max(0.0, min(1.0, score))
+        return None
+
+    def _apply_completion_quality_gate(self, *, state: ExecutionState, payload: dict[str, Any]) -> None:
+        if not state.model_marked_complete:
+            return
+        score = self._coerce_score(payload)
+        reason = str(payload.get("reason") or payload.get("result") or payload.get("performance_result") or "").strip()
+        review = payload.get("self_review")
+        if isinstance(review, dict):
+            if not reason:
+                reason = str(review.get("reason") or review.get("result") or "").strip()
+        cannot_improve = bool(payload.get("cannot_improve")) or bool(payload.get("no_further_upgrade"))
+        if isinstance(review, dict):
+            cannot_improve = cannot_improve or bool(review.get("cannot_improve")) or bool(
+                review.get("no_further_upgrade")
+            )
+
+        state.model_audit_count += 1
+        state.model_audit = {
+            "score": score,
+            "result": reason,
+            "pass": bool(score is not None and score >= state.completion_score_threshold),
+            "cannot_improve": cannot_improve,
+            "threshold": state.completion_score_threshold,
+        }
+        if score is None:
+            state.model_marked_complete = False
+            state.notes.append(
+                "Completion review required: provide a numeric score in [0,1] plus a short performance/result summary."
+            )
+            return
+        if score >= state.completion_score_threshold:
+            return
+        if state.completion_refine_attempts < state.completion_max_refines:
+            state.completion_refine_attempts += 1
+            state.model_marked_complete = False
+            state.notes.append(
+                f"Completion score {score:.2f} is below {state.completion_score_threshold:.2f}; refine the answer and resubmit."
+            )
+            return
+        if cannot_improve:
+            state.completion_no_further_upgrade_ack = True
+            state.notes.append(
+                "Completion score remains below threshold, but model indicated no further upgrade is possible; accepting stop."
+            )
+            return
+        state.model_marked_complete = False
+        state.notes.append(
+            "Completion score remains below threshold after one refine; either improve again or return cannot_improve=true."
+        )
 
     def _local_feedback_action(self, *, state: ExecutionState) -> ActionRequest | None:
         if "web_search" in state.available_tools:
@@ -1375,6 +1456,8 @@ class StarforgeRuntime:
             "- {\"tool\":\"<name>\",\"args\":{...},\"rationale\":\"...\"}\n"
             "- {\"calls\":[{\"tool\":\"<name>\",\"args\":{...},\"rationale\":\"...\"}, ...]}\n"
             "If the objective is fully complete, output: {\"done\":true,\"final_answer\":\"...\"}.\n"
+            "When declaring completion, include a self-review score in [0,1] and result summary, e.g. "
+            "{\"done\":true,\"final_answer\":\"...\",\"self_review\":{\"score\":0.93,\"result\":\"...\"}}.\n"
             "Do not invent tools outside the allowed list."
         )
         if state.require_done_stop_token:
@@ -1384,6 +1467,11 @@ class StarforgeRuntime:
                 "\nBefore every completion attempt, verify the objective is fully satisfied; "
                 "if not, return concrete tool calls instead of done=true."
             )
+        system_prompt += (
+            f"\nQuality gate: completion requires score >= {state.completion_score_threshold:.2f}."
+            f" If score is below threshold, improve and retry. After {state.completion_max_refines} refine cycle(s), "
+            "you may stop only by explicitly setting cannot_improve=true in self_review."
+        )
         user_prompt = (
             f"Objective:\n{state.objective}\n\n"
             f"Available tools:\n{', '.join(state.available_tools)}\n\n"
