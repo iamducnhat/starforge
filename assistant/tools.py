@@ -340,8 +340,19 @@ class ToolSystem:
         tool_args: dict[str, Any] | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            return {"ok": False, "created": False, "error": "name is required"}
+        if normalized_name in self._tools:
+            return {
+                "ok": False,
+                "created": False,
+                "error": f"name collides with system tool: {normalized_name}",
+            }
+        if not normalized_name.endswith("_agent_"):
+            normalized_name = f"{normalized_name}_agent_"
         return self.function_registry.create_function(
-            name=name,
+            name=normalized_name,
             description=description,
             keywords=keywords,
             code=code,
@@ -364,8 +375,19 @@ class ToolSystem:
         steps_template: list[dict[str, Any]] | None = None,
         match_conditions: list[str] | None = None,
     ) -> dict[str, Any]:
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            return {"ok": False, "created": False, "error": "name is required"}
+        if normalized_name in self._tools:
+            return {
+                "ok": False,
+                "created": False,
+                "error": f"name collides with system tool: {normalized_name}",
+            }
+        if not normalized_name.endswith("_agent_"):
+            normalized_name = f"{normalized_name}_agent_"
         return self.function_registry.create_skill(
-            name=name,
+            name=normalized_name,
             description=description,
             keywords=keywords,
             code=code,

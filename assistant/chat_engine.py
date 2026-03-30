@@ -2522,8 +2522,6 @@ class ChatEngine:
             return tool_calls
         if any(call.get("name") == "get_current_datetime" for call in tool_calls):
             return tool_calls
-        if not self._is_time_sensitive_factual(user_message):
-            return tool_calls
         return [{"name": "get_current_datetime", "args": {}}] + tool_calls
 
     def _presearch_tool_calls_for_factual(
@@ -2583,11 +2581,18 @@ class ChatEngine:
             "from",
             "this",
             "that",
+            "could",
+            "would",
+            "should",
+            "using",
+            "make",
+            "show",
+            "search",
         }
         compact = [k for k in keys if k not in stop]
         if compact:
             return " ".join(compact[:10])
-        return raw
+        return raw[:160]
 
     @staticmethod
     def _extract_explicit_file_paths(text: str, limit: int = 3) -> list[str]:
@@ -2787,7 +2792,7 @@ class ChatEngine:
         ]
         if not self._looks_coding_request(user_message):
             calls.append(
-                {"name": "search_web", "args": {"query": user_message, "level": "auto"}}
+                {"name": "search_web", "args": {"query": query, "level": "auto"}}
             )
         return calls
 
@@ -2796,7 +2801,8 @@ class ChatEngine:
 
     def _presearch_tool_calls_for_code(self, user_message: str) -> list[dict[str, Any]]:
         keywords = self._extract_keywords(user_message)
-        normalized = re.sub(r"\s+", " ", user_message).strip().strip("'\"`")
+        normalized = self._optimize_search_query(user_message)
+        normalized = re.sub(r"\s+", " ", normalized).strip().strip("'\"`")
         normalized = re.sub(r"[\"'`]+", "", normalized)
         research_query = f"how to {normalized} in python"
         return [

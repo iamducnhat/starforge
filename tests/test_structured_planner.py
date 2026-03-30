@@ -245,6 +245,32 @@ class TestStructuredPlanner(unittest.TestCase):
 
         self.assertEqual(biased, calls)
 
+    def test_ensure_datetime_call_for_factual_always_inserts_when_missing(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        engine._requires_web_presearch_for_factual = lambda _msg: True  # type: ignore[method-assign]
+        calls = [{"name": "search_web", "args": {"query": "python packaging"}}]
+
+        ensured = engine._ensure_datetime_call_for_factual(
+            user_message="What is the latest Python packaging standard?",
+            tool_calls=calls,
+            datetime_executed=False,
+        )
+
+        self.assertEqual(ensured[0]["name"], "get_current_datetime")
+        self.assertEqual(ensured[1]["name"], "search_web")
+
+    def test_emergency_calls_use_optimized_query_not_raw_prompt(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        engine._looks_coding_request = lambda _msg: False  # type: ignore[method-assign]
+        user_message = (
+            "Please search and explain the latest inflation trends in detail with examples"
+        )
+
+        calls = engine._emergency_tool_calls(user_message)
+        web_call = next(call for call in calls if call.get("name") == "search_web")
+
+        self.assertNotEqual(web_call["args"]["query"], user_message)
+
     def test_preinspect_uses_list_files_for_explicit_directory_paths(self):
         root = Path("test_preinspect_directory_paths")
         memory = MemoryStore(root / "memory_blocks")
