@@ -52,6 +52,46 @@ def test_run_human_readable_prints_human_readable_summary(capsys) -> None:
     assert '"success": true' not in captured.out.lower()
 
 
+def test_run_human_readable_prints_completion_audit_and_terminal_log(capsys) -> None:
+    payload = _fake_result()
+    payload["actions"] = [
+        {
+            "tool": "run_command",
+            "status": "completed",
+            "observation": {
+                "type": "command_result",
+                "content": {
+                    "command": "pytest -q",
+                    "stdout": "1 passed",
+                    "stderr": "",
+                    "exit_code": 0,
+                },
+                "metadata": {},
+            },
+        }
+    ]
+    payload["result"] = {
+        "human_readable": "Finished.",
+        "model_audit": {
+            "pass": True,
+            "score": 0.98,
+            "threshold": 0.97,
+            "result": "All checks passed.",
+            "cannot_improve": False,
+        },
+    }
+    with patch("starforge.cli.run", return_value=payload):
+        code = main(["run", "demo objective", "--human-readable", "--no-ansi"])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "Completion audit:" in captured.out
+    assert "- score: 0.98" in captured.out
+    assert "Terminal output log:" in captured.out
+    assert "command: pytest -q" in captured.out
+    assert "1 passed" in captured.out
+
+
 def test_run_forwards_model_feedback_options() -> None:
     with patch("starforge.cli.run", return_value=_fake_result()) as mocked:
         code = main(
