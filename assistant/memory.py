@@ -1257,9 +1257,11 @@ class MemoryStore:
         self, keywords: list[str], limit: int = 5
     ) -> list[dict[str, Any]]:
         """
-        Search for memory blocks matching the given keywords.
+        Retrieve previously learned solutions, patterns, or insights that may
+        apply to the current task.
 
-        Combines keyword overlap with semantic similarity over local embeddings.
+        This is intended as a fast local knowledge lookup, especially useful
+        before web search when the task seems familiar.
         """
         requested = set(normalize_keywords(keywords))
         if not requested:
