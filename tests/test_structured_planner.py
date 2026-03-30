@@ -210,6 +210,41 @@ class TestStructuredPlanner(unittest.TestCase):
         self.assertIn("workspaces/crypto_research", paths)
         self.assertIn("README.md", paths)
 
+    def test_looks_familiar_task_detects_reuse_markers(self):
+        self.assertTrue(ChatEngine._looks_familiar_task("Can you solve this again?"))
+        self.assertTrue(
+            ChatEngine._looks_familiar_task("Use a similar fix as before for this bug")
+        )
+        self.assertFalse(ChatEngine._looks_familiar_task("Explain TLS certificates"))
+
+    def test_bias_memory_before_web_adds_find_memory_for_familiar_search(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        calls = [{"name": "search_web", "args": {"query": "fix import cycle"}}]
+
+        biased = engine._bias_memory_before_web_search(
+            user_message="This looks similar to the issue we solved last time",
+            tool_calls=calls,
+            memory_checked=False,
+        )
+
+        self.assertEqual(biased[0]["name"], "find_in_memory")
+        self.assertEqual(biased[1]["name"], "search_web")
+
+    def test_bias_memory_before_web_respects_existing_memory_call(self):
+        engine = ChatEngine(model=_DummyModel(), tools=_DummyTools(), system_prompt="test")
+        calls = [
+            {"name": "find_in_memory", "args": {"keywords": ["import", "cycle"]}},
+            {"name": "search_web", "args": {"query": "python import cycle fix"}},
+        ]
+
+        biased = engine._bias_memory_before_web_search(
+            user_message="Find the best fix",
+            tool_calls=calls,
+            memory_checked=False,
+        )
+
+        self.assertEqual(biased, calls)
+
     def test_preinspect_uses_list_files_for_explicit_directory_paths(self):
         root = Path("test_preinspect_directory_paths")
         memory = MemoryStore(root / "memory_blocks")

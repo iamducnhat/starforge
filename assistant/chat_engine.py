@@ -2482,6 +2482,25 @@ class ChatEngine:
         )
         return any(m in t for m in markers)
 
+    @staticmethod
+    def _looks_familiar_task(user_message: str) -> bool:
+        t = user_message.lower()
+        familiarity_markers = (
+            "again",
+            "same",
+            "similar",
+            "like before",
+            "as before",
+            "last time",
+            "previous",
+            "earlier",
+            "already solved",
+            "repeat",
+            "revisit",
+            "worked before",
+        )
+        return any(marker in t for marker in familiarity_markers)
+
     def _ensure_datetime_call_for_factual(
         self,
         user_message: str,
@@ -2730,6 +2749,34 @@ class ChatEngine:
         if tool_calls and tool_calls[0].get("name") == "get_current_datetime":
             return [tool_calls[0], mem_call] + tool_calls[1:]
         return [mem_call] + tool_calls
+
+    def _bias_memory_before_web_search(
+        self,
+        user_message: str,
+        tool_calls: list[dict[str, Any]],
+        memory_checked: bool,
+    ) -> list[dict[str, Any]]:
+        if memory_checked:
+            return tool_calls
+        if not any(call.get("name") == "search_web" for call in tool_calls):
+            return tool_calls
+        if any(call.get("name") in {"find_in_memory", "search_memory"} for call in tool_calls):
+            return tool_calls
+
+        should_probe_memory = self._looks_familiar_task(user_message) or not any(
+            str(call.get("name", "")) not in {"get_current_datetime", "search_web"}
+            for call in tool_calls
+        )
+        if not should_probe_memory:
+            return tool_calls
+
+        memory_call = {
+            "name": "find_in_memory",
+            "args": {"keywords": self._extract_keywords(user_message)},
+        }
+        if tool_calls and tool_calls[0].get("name") == "get_current_datetime":
+            return [tool_calls[0], memory_call] + tool_calls[1:]
+        return [memory_call] + tool_calls
 
     def _emergency_tool_calls(self, user_message: str) -> list[dict[str, Any]]:
         keywords = self._extract_keywords(user_message)
@@ -3149,6 +3196,11 @@ class ChatEngine:
                     user_message=user_message,
                     tool_calls=tool_calls,
                     web_search_executed=web_search_executed_this_turn,
+                )
+                tool_calls = self._bias_memory_before_web_search(
+                    user_message=user_message,
+                    tool_calls=tool_calls,
+                    memory_checked=memory_checked_this_turn,
                 )
             if not tool_calls:
                 pending_nonthink = "".join(pending_nonthink_chunks)
