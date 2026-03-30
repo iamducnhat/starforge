@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "starforge"
+version = "0.1.0"
+description = "General-purpose autonomous agent runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "requests",
+]
+
+[project.scripts]
+starforge = "starforge.cli:main"
+
+[tool.setuptools]
+packages = ["assistant", "starforge", "starforge.tools"]
