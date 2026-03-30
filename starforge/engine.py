@@ -357,7 +357,7 @@ class DefaultPlanner:
         configured = list(state.context.metadata.get("search_queries", []) or [])
         if configured:
             return str(configured[0])
-        return state.objective
+        return self._compact_search_query(state.objective)
 
     def _enqueue_unique(
         self,
@@ -480,6 +480,9 @@ class DefaultPlanner:
     def _schedule_exploratory_step(self, state: ExecutionState) -> None:
         if state.pending:
             return
+        # Skip auto-search for purely local objectives (e.g., "read X, run Y, write Z").
+        if self._objective_is_local_task(state.objective):
+            return
         if "web_search" in state.available_tools and len(state.seen_search_queries) < 2:
             query = self._initial_search_query(state)
             if state.seen_search_queries:
@@ -565,6 +568,35 @@ class DefaultPlanner:
             return state.objective
         compact = " ".join(tokens[:12])
         return compact
+
+    @staticmethod
+    def _objective_is_local_task(objective: str) -> bool:
+        """Heuristic: avoid web_search when the objective is a local file/command workflow."""
+        lowered = objective.lower()
+        local_markers = (
+            "workspace",
+            "workspaces",
+            "directory",
+            "folder",
+            "file",
+            "read ",
+            "write ",
+            "run ",
+            "using write_file",
+            "using run_command",
+            ".py",
+            ".md",
+            "/",
+        )
+        return any(marker in lowered for marker in local_markers)
+
+    @staticmethod
+    def _compact_search_query(text: str) -> str:
+        cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
+        tokens = [token for token in cleaned.split() if len(token) > 2]
+        if not tokens:
+            return text.strip()
+        return " ".join(tokens[:12])
 
     def _handle_filesystem_snapshot_followups(
         self,
